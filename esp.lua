@@ -1,34 +1,23 @@
 --[[
-    VisionWare | ESP + Aimbot  (Phantom Forces)  -- wapus method
-    ===========================================================
-    This is a faithful port of the wapus ESP/aimbot technique into the
-    VisionWare GUI (gui.lua). It does NOT use PlayerTag or Player.Character
-    scanning like typical ESPs. Instead it:
+    VisionWare | ESP + Aimbot  (Phantom Forces)  -- Xeno compatible
+    ==============================================================
+    IMPORTANT: This build is made for the Xeno executor.
+    wapus's method (hooking Phantom Forces internal modules via getgc /
+    run_on_actor) needs functions Xeno does not provide (low sUNC,
+    external executor). So ESP + Aimbot use the standard executor APIs
+    Xeno DOES support: Drawing, Players/Character tracking,
+    WorldToViewportPoint projection, and mousemoverel.
 
-      1) WAITS for the game's internal module cache (like wapus's loader)
-         so it never initializes "too soon" -- nothing is hard-captured
-         at load, the camera is resolved fresh every frame.
-      2) Loads the Sirius ESP library and binds it to the real Phantom
-         Forces modules (ReplicationInterface / ThirdPersonObject) with
-         a setCharacterRender hook to force third-person rendering.
-      3) Aimbot = screen-space FOV target selection + ballistic lead
-         (complexTrajectory) written into the camera animator's angles
-         (cameraObj._angles/_delta) -- no mousemoverel.
-
-    The loader runs gui.lua first, so Library exists here.
+    Not-loaded-too-soon: the camera is resolved fresh every frame (never
+    captured at load) and we wait for the game to be ready before
+    building ESP objects. All game access is nil/pcall-safe so it
+    degrades gracefully until the round starts.
 ]]
 
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local workspace        = game:GetService("Workspace")
 local LocalPlayer      = Players.LocalPlayer
-
-local pi  = math.pi
-local tau = 2 * pi
-
--- // No-op guards (wapus defines these as no-ops too)
-local LPH_NO_VIRTUALIZE = function(f) return f end
 
 -- // Wait for the VisionWare GUI, then hook its flags
 local Library
@@ -47,167 +36,325 @@ local function Opacity(Percent)
     return math.clamp((tonumber(Percent) or 100) / 100, 0, 1)
 end
 
--- =====================================================================
---  1) WAIT FOR THE GAME MODULES  (the "don't load too soon" gate)
--- =====================================================================
--- Pull the internal module-cache table out of the Lua GC, exactly like
--- wapus's loader -> Main Cheat. Nothing below runs until it exists.
-local function GetModuleCache()
-    local ok, cache = pcall(function()
-        for _, v in getgc(true) do
-            if type(v) == "table" and rawget(v, "ScreenCull") and rawget(v, "NetworkClient") then
-                return v
-            end
-        end
-    end)
-    return ok and cache or nil
-end
-
-local moduleCache
-repeat
-    moduleCache = GetModuleCache()
-    if not moduleCache then task.wait(0.5) end
-until moduleCache ~= nil
-
-local modules = {}
-for name, data in moduleCache do
-    if data then
-        if type(data) == "table" then modules[name] = data.module
-        else modules[name] = data end
-    end
-end
-
-local replicationInterface = modules.ReplicationInterface
-local thirdPersonObject    = modules.ThirdPersonObject
-local cameraInterface      = modules.CameraInterface
-local weaponInterface      = modules.WeaponControllerInterface
-local publicSettings       = modules.PublicSettings
-
-if not (replicationInterface and thirdPersonObject and cameraInterface) then
-    warn("[VisionWare] Could not bind PF modules - not in a Phantom Forces round?")
-    return
-end
-
--- Resolve camera fresh each frame (never captured at load)
 local function GetCamera()
     return workspace.CurrentCamera
 end
-
-local function GetChar(player)
-    local entry, third
-    local ok = pcall(function()
-        entry = replicationInterface.getEntry(player)
-        third = entry:isReady() and entry._smoothReplication and entry._smoothReplication._prevFrameTime and entry:getThirdPersonObject()
-    end)
-    if not ok then return nil, nil end
-    if not third then return nil, nil end
-    local model, root
-    local ok2 = pcall(function()
-        model = third:getCharacterModel()
-        root  = third:getRootPart()
-    end)
-    if not ok2 then return nil, nil end
-    return model, root
-end
-
--- =====================================================================
---  2) ESP  -- Sirius library bound to the real modules (wapus method)
--- =====================================================================
-local espInterface
-pcall(function()
-    espInterface = loadstring(game:HttpGet("https://raw.githubusercontent.com/jensonhirst/Sirius/refs/heads/request/library/sense/source.lua"))()
-end)
 
 local function IsPanic()
     return Flag("Misc_Panic", false)
 end
 
-local function SyncEspSettings()
-    if not espInterface then return end
-    local t = espInterface.teamSettings
-    if not t then return end
+local TEAMS = {
+    ["Bright blue"]   = "Phantoms",
+    ["Bright orange"] = "Ghosts",
+}
 
-    local espOn = not IsPanic() and Flag("ESP_Enabled", true)
-    local enemy = t.enemy
-    local friendly = t.friendly
-
-    local enemyColor = Flag("ESP_EnemyColor", Color3.fromRGB(0, 255, 255)) or Color3.fromRGB(0, 255, 255)
-    local teamColor  = Flag("ESP_TeamColor", Color3.fromRGB(86, 227, 120)) or Color3.fromRGB(86, 227, 120)
-    local opacity    = Opacity(Flag("ESP_Opacity", 75))
-
-    enemy.enabled        = espOn
-    enemy.box            = espOn and Flag("ESP_Boxes", true)
-    enemy.boxColor       = { enemyColor, opacity }
-    enemy.healthBar      = espOn and Flag("ESP_Health", true)
-    enemy.healthyColor   = Color3.fromRGB(0, 255, 0)
-    enemy.dyingColor     = Color3.fromRGB(255, 0, 0)
-    enemy.name           = espOn and Flag("ESP_Names", true)
-    enemy.nameColor      = { Color3.fromRGB(255, 255, 255), 1 }
-    enemy.distance       = espOn and Flag("ESP_Distance", false)
-    enemy.distanceColor  = { Color3.fromRGB(255, 255, 255), 1 }
-    enemy.tracer         = espOn and Flag("ESP_Tracers", true)
-    enemy.tracerColor    = { enemyColor, opacity }
-    enemy.tracerOrigin   = (function()
-        local o = Flag("ESP_TracerType", "From Bottom")
-        if o == "From Top" then return "Top"
-        elseif o == "From Center" then return "Middle"
-        else return "Bottom" end
-    end)()
-    enemy.chams          = espOn and Flag("ESP_Chams", true)
-    enemy.chamsFillColor = { Flag("ESP_ChamsColor", Color3.fromRGB(255, 255, 255)), 0.5 }
-    enemy.chamsOutlineColor = { Flag("ESP_ChamsColor", Color3.fromRGB(255, 255, 255)), 0 }
-
-    friendly.enabled    = espOn and Flag("ESP_ShowTeam", false)
-    friendly.box        = espOn and Flag("ESP_ShowTeam", false) and Flag("ESP_Boxes", true)
-    friendly.boxColor   = { teamColor, opacity }
-    friendly.healthBar  = espOn and Flag("ESP_ShowTeam", false) and Flag("ESP_Health", true)
-    friendly.name       = espOn and Flag("ESP_ShowTeam", false) and Flag("ESP_Names", true)
-    friendly.distance   = espOn and Flag("ESP_ShowTeam", false) and Flag("ESP_Distance", false)
-    friendly.tracer     = espOn and Flag("ESP_ShowTeam", false) and Flag("ESP_Tracers", true)
-    friendly.tracerColor= { teamColor, opacity }
+local function TeamName(player)
+    return TEAMS[tostring(player and player.TeamColor)] or "Unknown"
 end
 
-if espInterface then
-    espInterface.teamSettings = {
-        enemy = { enabled = false, box = false, boxColor = { Color3.fromRGB(255,0,0), 1 }, boxOutline = true, boxOutlineColor = { Color3.new(), 1 }, boxFill = false, boxFillColor = { Color3.fromRGB(255,0,0), 0.5 }, healthBar = false, healthyColor = Color3.fromRGB(0,255,0), dyingColor = Color3.fromRGB(255,0,0), healthBarOutline = true, healthBarOutlineColor = { Color3.new(), 0.5 }, healthText = false, healthTextColor = { Color3.new(1,1,1), 1 }, healthTextOutline = true, healthTextOutlineColor = Color3.new(), box3d = false, box3dColor = { Color3.new(1,0,0), 1 }, name = false, nameColor = { Color3.new(1,1,1), 1 }, nameOutline = true, nameOutlineColor = Color3.new(), weapon = false, weaponColor = { Color3.new(1,1,1), 1 }, weaponOutline = true, weaponOutlineColor = Color3.new(), distance = false, distanceColor = { Color3.new(1,1,1), 1 }, distanceOutline = true, distanceOutlineColor = Color3.new(), tracer = false, tracerOrigin = "Bottom", tracerColor = { Color3.new(1,0,0), 1 }, tracerOutline = true, tracerOutlineColor = { Color3.new(), 1 }, offScreenArrow = false, offScreenArrowColor = { Color3.new(1,1,1), 1 }, offScreenArrowSize = 15, offScreenArrowRadius = 150, offScreenArrowOutline = true, offScreenArrowOutlineColor = { Color3.new(), 1 }, chams = false, chamsVisibleOnly = false, chamsFillColor = { Color3.fromRGB(0.2,0.2,0.2), 0.5 }, chamsOutlineColor = { Color3.fromRGB(1,0,0), 0 } },
-        friendly = { enabled = false, box = false, boxColor = { Color3.fromRGB(0,255,0), 1 }, boxOutline = true, boxOutlineColor = { Color3.new(), 1 }, boxFill = false, boxFillColor = { Color3.fromRGB(0,255,0), 0.5 }, healthBar = false, healthyColor = Color3.fromRGB(0,255,0), dyingColor = Color3.fromRGB(255,0,0), healthBarOutline = true, healthBarOutlineColor = { Color3.new(), 0.5 }, healthText = false, healthTextColor = { Color3.new(1,1,1), 1 }, healthTextOutline = true, healthTextOutlineColor = Color3.new(), box3d = false, box3dColor = { Color3.new(0,1,0), 1 }, name = false, nameColor = { Color3.new(1,1,1), 1 }, nameOutline = true, nameOutlineColor = Color3.new(), weapon = false, weaponColor = { Color3.new(1,1,1), 1 }, weaponOutline = true, weaponOutlineColor = Color3.new(), distance = false, distanceColor = { Color3.new(1,1,1), 1 }, distanceOutline = true, distanceOutlineColor = Color3.new(), tracer = false, tracerOrigin = "Bottom", tracerColor = { Color3.new(0,1,0), 1 }, tracerOutline = true, tracerOutlineColor = { Color3.new(), 1 }, offScreenArrow = false, offScreenArrowColor = { Color3.new(1,1,1), 1 }, offScreenArrowSize = 15, offScreenArrowRadius = 150, offScreenArrowOutline = true, offScreenArrowOutlineColor = { Color3.new(), 1 }, chams = false, chamsVisibleOnly = false, chamsFillColor = { Color3.fromRGB(0.2,0.2,0.2), 0.5 }, chamsOutlineColor = { Color3.fromRGB(0,1,0), 0 } }
+-- =====================================================================
+--  Drawing helpers (Xeno Drawing API, safe)
+-- =====================================================================
+local function NewDrawing(kind)
+    if not (Drawing and Drawing.new) then return nil end
+    local ok, d = pcall(Drawing.new, kind)
+    return ok and d or nil
+end
+
+local function WorldToScreen(pos)
+    local camera = GetCamera()
+    if not camera then return nil, false end
+    local s, onScreen = camera:WorldToViewportPoint(pos)
+    return Vector2.new(s.X, s.Y), onScreen
+end
+
+-- =====================================================================
+--  ESP state per player  (Drawings created ONCE, not per frame)
+-- =====================================================================
+local Tracked = {} -- [player] = esp
+
+local function NewEsp(player)
+    local esp = {
+        player = player,
+        sq       = NewDrawing("Square"),
+        sqFill   = NewDrawing("Square"),
+        sqOutline= NewDrawing("Square"),
+        health   = NewDrawing("Square"),
+        tracer   = NewDrawing("Line"),
+        nameLbl  = NewDrawing("Text"),
+        distLbl  = NewDrawing("Text"),
+        hpLbl    = NewDrawing("Text"),
+        highlight = nil,
     }
 
-    espInterface.getCharacter = LPH_NO_VIRTUALIZE(function(player)
-        local model, root = GetChar(player)
-        return model, root
-    end)
-
-    espInterface.getHealth = LPH_NO_VIRTUALIZE(function(player, character)
-        local entry = replicationInterface.getEntry(player)
-        local hp
-        pcall(function() hp = entry:getHealth() end)
-        if hp then return hp, 100 end
-        if character then
-            local h = character:FindFirstChild("Humanoid")
-            if h then return h.Health, h.MaxHealth end
-        end
-        return 100, 100
-    end)
-
-    espInterface.isFriendly = function(player)
-        local entry = replicationInterface.getEntry(player)
-        return not entry._isEnemy
+    local function StyleText(t)
+        if not t then return end
+        t.Size = 13
+        t.Font = Drawing.Fonts.UI
+        t.Center = true
+        t.Outline = true
+        t.OutlineColor = Color3.fromRGB(0, 0, 0)
+        t.Visible = false
     end
+    StyleText(esp.nameLbl)
+    StyleText(esp.distLbl)
+    StyleText(esp.hpLbl)
 
-    -- Force third-person rendering so characters (and ESP) actually show.
-    local setCharacterRender = thirdPersonObject.setCharacterRender
-    thirdPersonObject.setCharacterRender = function(self, render)
-        local force = not IsPanic() and Flag("ESP_Enabled", true)
-        return setCharacterRender(self, render or (force and self._player ~= LocalPlayer))
-    end
+    if esp.sq then esp.sq.Filled = false; esp.sq.Visible = false end
+    if esp.sqFill then esp.sqFill.Filled = true; esp.sqFill.Visible = false end
+    if esp.sqOutline then esp.sqOutline.Filled = false; esp.sqOutline.Visible = false end
+    if esp.health then esp.health.Filled = true; esp.health.Visible = false end
+    if esp.tracer then esp.tracer.Visible = false end
 
-    espInterface.Load()
+    return esp
 end
 
--- Keep the ESP settings in sync with the GUI (see Heartbeat at the bottom)
+Players.PlayerAdded:Connect(function(p)
+    if p ~= LocalPlayer then Tracked[p] = NewEsp(p) end
+end)
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then Tracked[p] = NewEsp(p) end
+end
+Players.PlayerRemoving:Connect(function(player)
+    local esp = Tracked[player]
+    if not esp then return end
+    pcall(function()
+        for _, o in ipairs({ esp.sq, esp.sqFill, esp.sqOutline, esp.health, esp.tracer, esp.nameLbl, esp.distLbl, esp.hpLbl }) do
+            if o then o:Remove() end
+        end
+    end)
+    pcall(function() if esp.highlight then esp.highlight:Destroy() end end)
+    Tracked[player] = nil
+end)
+
+local function GetChar(player)
+    return player and player.Character
+end
+
+local function GetRoot(char)
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart or char:FindFirstChildWhichIsA("BasePart")
+end
+
+local function GetHead(char)
+    return char and char:FindFirstChild("Head")
+end
+
 -- =====================================================================
---  3) AIMBOT  -- camera-angle + ballistic lead (wapus method)
+--  ESP render loop  (30 fps throttle to keep Xeno smooth)
+-- =====================================================================
+local lastRender = 0
+
+RunService.RenderStepped:Connect(function()
+    if tick() - lastRender < 1 / 30 then return end
+    lastRender = tick()
+
+    local panic = IsPanic()
+    local espOn = not panic and Flag("ESP_Enabled", true)
+    local range = Flag("ESP_Range", 1000) or 1000
+    local camera = GetCamera()
+    if not camera then return end
+    local camPos = camera.CFrame.Position
+
+    local showTeam = Flag("ESP_ShowTeam", false)
+    local teamCheck = Flag("ESP_TeamCheck", true)
+    local thickness = Flag("ESP_BoxThickness", 1) or 1
+    local textSize = Flag("ESP_TextSize", 13) or 13
+    local drawBoxes = espOn and Flag("ESP_Boxes", true)
+    local drawHealth = espOn and Flag("ESP_Health", true)
+    local drawTracers = espOn and Flag("ESP_Tracers", true)
+    local drawNames = espOn and Flag("ESP_Names", true)
+    local drawDist = espOn and Flag("ESP_Distance", false)
+    local drawChams = espOn and Flag("ESP_Chams", true)
+    local hs = Flag("ESP_HealthStyle", "Both")
+    local drawHP = espOn and (hs == "Text" or hs == "Both")
+    local useOutline = espOn and Flag("ESP_Outline", true)
+    local fillEnabled = espOn and Flag("ESP_BoxType", "2D Box") == "Filled Box"
+    local enemyCol = Flag("ESP_EnemyColor", Color3.fromRGB(0, 255, 255)) or Color3.fromRGB(0, 255, 255)
+    local teamCol = Flag("ESP_TeamColor", Color3.fromRGB(86, 227, 120)) or Color3.fromRGB(86, 227, 120)
+    local opacity = Opacity(Flag("ESP_Opacity", 75))
+
+    for _, esp in pairs(Tracked) do
+        local player = esp.player
+        local char = GetChar(player)
+        local root = GetRoot(char)
+        local head = GetHead(char)
+
+        local enemy = TeamName(player) ~= TeamName(LocalPlayer)
+        local isTeam = not enemy
+        local showThis = espOn and char and root and char:FindFirstChild("Humanoid") and (enemy or (isTeam and showTeam and not teamCheck))
+
+        local function HideAll()
+            pcall(function()
+                for _, o in ipairs({ esp.sq, esp.sqFill, esp.sqOutline, esp.health, esp.tracer, esp.nameLbl, esp.distLbl, esp.hpLbl }) do
+                    if o then o.Visible = false end
+                end
+            end)
+        end
+
+        if not showThis then
+            HideAll()
+            if esp.highlight then esp.highlight.Enabled = false end
+            continue
+        end
+
+        local color = enemy and enemyCol or teamCol
+
+        local dist = (root.Position - camPos).Magnitude
+        if dist > range then
+            HideAll()
+            if esp.highlight then esp.highlight.Enabled = false end
+            continue
+        end
+
+        local headPos = (head and head.Position or root.Position) + (head and Vector3.new(0, 0.5, 0) or Vector3.zero)
+        local feetPos = root.Position - Vector3.new(0, root.Size.Y * 0.5, 0)
+
+        local top, topOn = WorldToScreen(headPos)
+        local bot, botOn = WorldToScreen(feetPos)
+        if not top or not bot or (not topOn and not botOn) then
+            HideAll()
+            continue
+        end
+
+        local height = math.abs(top.Y - bot.Y)
+        local width = height * 0.6
+        if height < 5 then
+            HideAll()
+            continue
+        end
+
+        local left = top.X - width / 2
+        local bboxTop = top.Y
+        local bboxBot = bot.Y
+        local cy = (bboxTop + bboxBot) / 2
+
+        -- Chams
+        if esp.highlight then
+            if drawChams then
+                esp.highlight.Enabled = true
+                if Flag("ESP_Rainbow", false) then
+                    esp.highlight.FillColor = Color3.fromHSV((tick() % 1), 1, 1)
+                else
+                    esp.highlight.FillColor = Flag("ESP_ChamsColor", Color3.fromRGB(255, 255, 255)) or Color3.fromRGB(255, 255, 255)
+                end
+            else
+                esp.highlight.Enabled = false
+            end
+        end
+
+        -- Box
+        if drawBoxes and esp.sq then
+            local o = Opacity(opacity)
+            local inset = 1
+            if useOutline and esp.sqOutline then
+                esp.sqOutline.Color = Color3.fromRGB(0, 0, 0)
+                esp.sqOutline.Thickness = thickness + 2
+                esp.sqOutline.Transparency = o
+                esp.sqOutline.Position = Vector2.new(left, bboxTop)
+                esp.sqOutline.Size = Vector2.new(width, height)
+                esp.sqOutline.Visible = true
+            elseif esp.sqOutline then
+                esp.sqOutline.Visible = false
+            end
+
+            esp.sq.Color = color
+            esp.sq.Thickness = thickness
+            esp.sq.Transparency = o
+            esp.sq.Position = Vector2.new(left + inset, bboxTop + inset)
+            esp.sq.Size = Vector2.new(width - inset * 2, height - inset * 2)
+            esp.sq.Visible = true
+
+            if fillEnabled and esp.sqFill then
+                esp.sqFill.Color = color
+                esp.sqFill.Transparency = o * 0.3
+                esp.sqFill.Position = esp.sq.Position
+                esp.sqFill.Size = esp.sq.Size
+                esp.sqFill.Visible = true
+            elseif esp.sqFill then
+                esp.sqFill.Visible = false
+            end
+        else
+            if esp.sq then esp.sq.Visible = false end
+            if esp.sqFill then esp.sqFill.Visible = false end
+            if esp.sqOutline then esp.sqOutline.Visible = false end
+        end
+
+        -- Health bar
+        if drawHealth and esp.health then
+            local humanoid = char:FindFirstChild("Humanoid")
+            local hp = humanoid and humanoid.Health or 100
+            local maxHp = humanoid and humanoid.MaxHealth or 100
+            local frac = math.clamp(hp / maxHp, 0, 1)
+            local barW = 3
+            local barX = left - barW - 3
+            local o = Opacity(opacity)
+            esp.health.Color = Color3.fromRGB(255, math.floor(255 * frac), math.floor(255 * (1 - frac)))
+            esp.health.Transparency = o
+            esp.health.Position = Vector2.new(barX, bboxTop + (height * (1 - frac)))
+            esp.health.Size = Vector2.new(barW, height * frac)
+            esp.health.Visible = true
+
+            if drawHP and esp.hpLbl then
+                esp.hpLbl.Text = tostring(math.floor(frac * 100)) .. "%"
+                esp.hpLbl.Color = color
+                esp.hpLbl.Size = textSize - 3
+                esp.hpLbl.Position = Vector2.new(left + width + 4, cy - (textSize / 2))
+                esp.hpLbl.Visible = true
+            elseif esp.hpLbl then
+                esp.hpLbl.Visible = false
+            end
+        else
+            if esp.health then esp.health.Visible = false end
+            if esp.hpLbl then esp.hpLbl.Visible = false end
+        end
+
+        -- Tracer
+        if drawTracers and esp.tracer then
+            local camSize = camera.ViewportSize
+            local from = Vector2.new(camSize.X / 2, camSize.Y)
+            local origin = Flag("ESP_TracerType", "From Bottom")
+            if origin == "From Top" then from = Vector2.new(camSize.X / 2, 0)
+            elseif origin == "From Center" then from = Vector2.new(camSize.X / 2, camSize.Y / 2) end
+
+            esp.tracer.From = from
+            esp.tracer.To = Vector2.new(left + width / 2, bboxBot)
+            esp.tracer.Color = color
+            esp.tracer.Thickness = Flag("ESP_TracerThickness", 1) or 1
+            esp.tracer.Transparency = opacity
+            esp.tracer.Visible = true
+        elseif esp.tracer then
+            esp.tracer.Visible = false
+        end
+
+        -- Name / distance
+        if drawNames and esp.nameLbl then
+            local label = Flag("ESP_NameMode", "DisplayName") == "Username" and player.Name or player.DisplayName
+            esp.nameLbl.Text = label
+            esp.nameLbl.Color = color
+            esp.nameLbl.Size = textSize
+            esp.nameLbl.Position = Vector2.new(left + width / 2, bboxTop - textSize - 2)
+            esp.nameLbl.Visible = true
+
+            if drawDist and esp.distLbl then
+                esp.distLbl.Text = string.format("%.0fm", dist)
+                esp.distLbl.Color = color
+                esp.distLbl.Size = textSize - 4
+                esp.distLbl.Position = Vector2.new(left + width / 2, bboxBot + 4)
+                esp.distLbl.Visible = true
+            elseif esp.distLbl then
+                esp.distLbl.Visible = false
+            end
+        else
+            if esp.nameLbl then esp.nameLbl.Visible = false end
+            if esp.distLbl then esp.distLbl.Visible = false end
+        end
+    end
+end)
+
+-- =====================================================================
+--  Aimbot  (Xeno: mousemoverel-based, no internal module hooks)
 -- =====================================================================
 local function IsKeyHeld(Key)
     if type(Key) == "EnumItem" then
@@ -224,219 +371,115 @@ local function IsKeyHeld(Key)
     return false
 end
 
--- Verbatim ballistic lead solver from wapus (credit: Mickey)
-local function solve(v44, v45, v46, v47, v48)
-    if not v44 then
-        return
-    elseif v44 > -1.0E-10 and v44 < 1.0E-10 then
-        return solve(v45, v46, v47, v48)
-    else
-        if v48 then
-            local v49 = -v45 / (4 * v44)
-            local v50 = (v46 + v49 * (3 * v45 + 6 * v44 * v49)) / v44
-            local v51 = (v47 + v49 * (2 * v46 + v49 * (3 * v45 + 4 * v44 * v49))) / v44
-            local v52 = (v48 + v49 * (v47 + v49 * (v46 + v49 * (v45 + v44 * v49)))) / v44
-            if v51 > -1.0E-10 and v51 < 1.0E-10 then
-                local v53, v54 = solve(1, v50, v52)
-                if not v54 or v54 < 0 then
-                    return
-                else
-                    local v55 = math.sqrt(v53)
-                    local v56 = math.sqrt(v54)
-                    return v49 - v56, v49 - v55, v49 + v55, v49 + v56
-                end
-            else
-                local v57, _, v59 = solve(1, 2 * v50, v50 * v50 - 4 * v52, -v51 * v51)
-                local v60 = v59 or v57
-                local v61 = math.sqrt(v60)
-                local v62, v63 = solve(1, v61, (v60 + v50 - v51 / v61) / 2)
-                local v64, v65 = solve(1, -v61, (v60 + v50 + v51 / v61) / 2)
-                if v62 and v64 then
-                    return v49 + v62, v49 + v63, v49 + v64, v49 + v65
-                elseif v62 then
-                    return v49 + v62, v49 + v63
-                elseif v64 then
-                    return v49 + v64, v49 + v65
-                end
+local function MoveMouse(dx, dy)
+    pcall(function()
+        if mousemoverel then mousemoverel(dx, dy)
+        elseif syn and syn.input and syn.input.mousemoverel then syn.input.mousemoverel(dx, dy) end
+    end)
+end
+
+local lastTarget, lastTargetLostTime
+
+local function GetAimTarget()
+    local mode = Flag("Aimbot_Target", "Closest to Crosshair")
+    local hitpart = Flag("Aimbot_Hitpart", "Head")
+    local camera = GetCamera()
+    if not camera then return nil end
+    local camPos = camera.CFrame.Position
+    local center = camera.ViewportSize / 2
+    local best, bestScore = nil, math.huge
+
+    for _, esp in pairs(Tracked) do
+        local player = esp.player
+        if player == LocalPlayer then continue end
+        if Flag("Aimbot_TeamCheck", true) and TeamName(player) == TeamName(LocalPlayer) then continue end
+
+        local char = GetChar(player)
+        local root = GetRoot(char)
+        if not char or not root or not char:FindFirstChild("Humanoid") then continue end
+
+        local part = char:FindFirstChild(hitpart) or root
+        local pos = part.Position
+        if (pos - camPos).Magnitude > (Flag("ESP_Range", 1000) or 1000) then continue end
+
+        local screen, onScreen = WorldToScreen(pos)
+        if not screen or not onScreen then continue end
+
+        local score
+        if mode == "Closest to Player" then
+            score = (pos - camPos).Magnitude
+        else
+            local h = char:FindFirstChild("Humanoid")
+            score = (screen - center).Magnitude
+            if mode == "Lowest Health" then
+                score = score + (h and (h.MaxHealth - h.Health) * 100 or 0)
             end
-        elseif v47 then
-            local v66 = -v45 / (3 * v44)
-            local v67 = -(v46 + v66 * (2 * v45 + 3 * v44 * v66)) / (3 * v44)
-            local v68 = -(v47 + v66 * (v46 + v66 * (v45 + v44 * v66))) / (2 * v44)
-            local v69 = v68 * v68 - v67 * v67 * v67
-            local v70 = math.sqrt(math.abs(v69))
-            if v69 > 0 then
-                local v71 = v68 + v70
-                local v72 = v68 - v70
-                v71 = v71 < 0 and -(-v71) ^ 0.3333333333333333 or v71 ^ 0.3333333333333333
-                local v73 = v72 < 0 and -(-v72) ^ 0.3333333333333333 or v72 ^ 0.3333333333333333
-                return v66 + v71 + v73
-            else
-                local v74 = math.atan2(v70, v68) / 3
-                local v75 = 2 * math.sqrt(v67)
-                return v66 - v75 * math.sin(v74 + 0.5235987755982988), v66 + v75 * math.sin(v74 - 0.5235987755982988), v66 + v75 * math.cos(v74)
-            end
-        elseif v46 then
-            local v76 = -v45 / (2 * v44)
-            local v77 = v76 * v76 - v46 / v44
-            if v77 < 0 then
-                return
-            else
-                local v78 = math.sqrt(v77)
-                return v76 - v78, v76 + v78
-            end
-        elseif v45 then
-            return -v45 / v44
         end
+
+        if score < bestScore then
+            bestScore = score
+            best = esp
+        end
+    end
+    return best
+end
+
+RunService.Heartbeat:Connect(function()
+    local panic = IsPanic()
+    local enabled = not panic and Flag("Aimbot_Enabled", true)
+    local key = Flag("Aimbot_Key", Enum.UserInputType.MouseButton2)
+    local active = enabled and IsKeyHeld(key)
+    _G.aimbotActive = active
+
+    if not active then
+        lastTarget = nil
         return
     end
-end
 
-local function complexTrajectory(o, a, t, s, e)
-    local ld = t - o
-    a = -a
-    e = e or Vector3.zero
-    local r1, r2, r3, r4 = solve(
-        a:Dot(a) * 0.25,
-        a:Dot(e),
-        a:Dot(ld) + e:Dot(e) - s * s,
-        ld:Dot(e) * 2,
-        ld:Dot(ld)
-    )
-    local x = (r1 and r1 > 0 and r1) or (r2 and r2 > 0 and r2) or (r3 and r3 > 0 and r3) or r4
-    if not x then return Vector3.zero, 0 end
-    local v = (ld + e * x + 0.5 * a * x * x) / x
-    return v, x
-end
-
-local function toanglesyx(v)
-    local x, y, z = v.X, v.Y, v.Z
-    return math.asin(y / (x * x + y * y + z * z) ^ 0.5), math.atan2(-x, -z), 0
-end
-
--- Screen-space FOV target selection over replication entries (wapus getClosest)
-local function GetClosest(origin, fovRadius, hitpart, visibleCheck)
-    local best, bestDist, bestPart = nil, math.huge, nil
-    local camera = GetCamera()
-    local camPos = camera and camera.CFrame and camera.CFrame.Position or Vector3.zero
-
-    replicationInterface.operateOnAllEntries(function(player, entry)
-        if player == LocalPlayer then return end
-        if Flag("Aimbot_TeamCheck", true) and not entry._isEnemy then return end
-
-        local model, root = GetChar(player)
-        local part = model and (model:FindFirstChild(hitpart) or root)
-        if not part then return end
-
-        local target = part.Position
-        if (target - camPos).Magnitude > (Flag("ESP_Range", 1000) or 1000) then return end
-
-        local screen, onScreen = camera:WorldToViewportPoint(target)
-        local screenDistance = (Vector2.new(screen.X, screen.Y) - origin).Magnitude
-        if screen.Z > 0 and onScreen and screenDistance < bestDist and screenDistance < fovRadius then
-            if visibleCheck then
-                local hit = workspace:Raycast(camPos, target - camPos)
-                if hit and hit.Instance and (hit.Instance:IsDescendantOf(model) or hit.Instance == model) then
-                    bestDist, bestPart, best = screenDistance, part, player
-                end
-            else
-                bestDist, bestPart, best = screenDistance, part, player
-            end
-        end
-    end)
-
-    return best, bestPart
-end
-
--- FOV radius (px) from VisionWare degrees, matching the GUI's drawn ring
-local function FovScreenRadius(FoVDeg, viewportY, camFov)
-    local Theta = math.rad(math.clamp(FoVDeg, 1, 179) / 2)
-    local Phi = math.rad(math.clamp(camFov, 1, 179) / 2)
-    return (viewportY / 2) * (math.tan(Theta) / math.tan(Phi))
-end
-
-local velCache = {} -- [player] = { pos, time }
-local aimTime
-local lastUpdate = 0
-
-RunService.RenderStepped:Connect(function(deltaTime)
-    if tick() - lastUpdate < 1 / 30 then return end
-    lastUpdate = tick()
-
-    local panic = IsPanic()
-    local aimEnabled = not panic and Flag("Aimbot_Enabled", true)
-    local key = Flag("Aimbot_Key", Enum.UserInputType.MouseButton2)
-    local activating = aimEnabled and IsKeyHeld(key)
     local camera = GetCamera()
     if not camera then return end
 
-    -- Active aimbot -> track velocity / lead up-to-date for all enemies
-    local controller, weapon, aiming
-    pcall(function()
-        controller = weaponInterface and weaponInterface.getActiveWeaponController()
-        weapon = controller and controller:getActiveWeapon()
-        aiming = weapon and weapon._aiming
-    end)
-
-    local clockTime = os.clock()
-
-    if not (activating and aiming) then
-        aimTime = nil
-        return
-    end
-
-    local fovRadius = Flag("Aimbot_FoVSize", 50) or 50
     local useFov = Flag("Aimbot_FoV", true)
+    local fovRadius = Flag("Aimbot_FoVSize", 50) or 50
     local smooth = Flag("Aimbot_Smoothness", 0.2) or 0.2
     local hitpart = Flag("Aimbot_Hitpart", "Head")
-    local visibleCheck = Flag("Aimbot_VisibleOnly", false)
+    local center = camera.ViewportSize / 2
 
-    local origin = camera.ViewportSize * 0.5
-    local pxRadius = useFov and FovScreenRadius(fovRadius, camera.ViewportSize.Y, camera.FieldOfView) or math.huge
+    local target = GetAimTarget()
 
-    local target = GetClosest(origin, pxRadius, hitpart, visibleCheck)
+    if target and useFov and Flag("Aimbot_Target", "Closest to Crosshair") == "Closest to Crosshair" then
+        local char = GetChar(target.player)
+        local part = char and (char:FindFirstChild(hitpart) or GetRoot(char))
+        local screen, onScreen = WorldToScreen(part and part.Position or Vector3.zero)
+        if screen and onScreen and (screen - center).Magnitude > fovRadius then
+            target = nil
+        end
+    end
+
+    if target and target ~= lastTarget then
+        if lastTarget and lastTargetLostTime and (tick() - lastTargetLostTime) < 0.15 then
+            target = nil
+        else
+            lastTarget = target
+            lastTargetLostTime = nil
+        end
+    end
+    if not target and lastTarget then
+        if not lastTargetLostTime then lastTargetLostTime = tick() end
+        lastTarget = nil
+    end
+
     if not target then return end
 
-    local model, root = GetChar(target)
-    local part = model and (model:FindFirstChild(hitpart) or root)
+    local char = GetChar(target.player)
+    local part = char and (char:FindFirstChild(hitpart) or GetRoot(char))
     if not part then return end
 
-    aimTime = aimTime or clockTime
-    local targetPos = part.Position
+    local screen, onScreen = WorldToScreen(part.Position)
+    if not screen or not onScreen then return end
 
-    -- Simple smooth velocity estimate (wapus uses a position-history cache)
-    local vel = Vector3.zero
-    local prev = velCache[target]
-    if prev then
-        local dt = (clockTime - prev.time)
-        if dt > 0 then vel = (targetPos - prev.pos) / dt end
-    end
-    velCache[target] = { pos = targetPos, time = clockTime }
-
-    local cameraObj
-    pcall(function() cameraObj = cameraInterface.getActiveCamera() end)
-    if not cameraObj then return end
-
-    local bulletSpeed = (weapon and weapon._weaponData and weapon._weaponData.bulletspeed) or 10000
-    local accel = publicSettings and publicSettings.bulletAcceleration or Vector3.new(0, -workspace.Gravity, 0)
-    local velocity = complexTrajectory(camera.CFrame * Vector3.new(0, 0, 0.5), accel, targetPos, bulletSpeed, vel)
-
-    local vx, vy = toanglesyx(velocity)
-    local cy = cameraObj._angles.Y
-    local x = vx > cameraObj._maxAngle and cameraObj._maxAngle or vx < cameraObj._minAngle and cameraObj._minAngle or vx
-    local y = (vy + pi - cy) % tau - pi + cy
-    local newangles = Vector3.new(x, y, 0)
-
-    if smooth ~= 0 then
-        newangles = cameraObj._angles:Lerp(newangles, math.clamp(1 - smooth + (clockTime - aimTime) ^ 2, 0, 1))
-    end
-
-    cameraObj._delta = (newangles - cameraObj._angles) / deltaTime
-    cameraObj._angles = newangles
+    local delta = (screen - center) * smooth
+    MoveMouse(delta.X, delta.Y)
 end)
 
-RunService.Heartbeat:Connect(function()
-    if espInterface then SyncEspSettings() end
-end)
-
-print("[VisionWare] ESP + Aimbot ready (wapus method)")
+print("[VisionWare] ESP + Aimbot loaded (Xeno build)")

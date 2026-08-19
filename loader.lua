@@ -3,15 +3,22 @@
 -- // To add more modules later, just append the filename to the Files table.
 local Loader = {
 	User = "aGodBridger",            -- GitHub username / owner
-	Repo = "robloxtest",             -- Repo name
+	Repo = "visionware",             -- Repo name
 	Branch = "main",                 -- Branch (main or master)
 	Files = {
-		"gui.lua",                   -- creates the Library and the full GUI menu
-		"esp.lua",                   -- draws ESP for other players
+		"gui.lua",                   -- creates the Library and the full GUI menu (loads FIRST)
+		"esp.lua",                   -- ESP + Aimbot, runs AFTER the GUI so it can hook Library
 		-- add more files below, e.g. "combat.lua",
 	},
 	Silent = false,                  -- true = hide "loaded" messages
 }
+
+-- // Run only once per executor session
+if (getgenv and getgenv().VisionWareLoaded) or _G.VisionWareLoaded then
+	return
+end
+local G = getgenv or function() return _G end
+G().VisionWareLoaded = true
 
 local BaseUrl = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(
 	Loader.User, Loader.Repo, Loader.Branch
@@ -55,7 +62,17 @@ end
 
 local Success, Errors = 0, {}
 for _, FileName in ipairs(Loader.Files) do
-	local Source = HttpGet(BaseUrl .. FileName)
+	if not Loader.Silent then
+		print(("[VisionWare] Fetching %s..."):format(FileName))
+	end
+
+	local Source
+	for _ = 1, 3 do -- retry a few times
+		Source = HttpGet(BaseUrl .. FileName)
+		if Source then break end
+		task.wait(1)
+	end
+
 	if not Source then
 		table.insert(Errors, FileName .. " - failed to fetch (check username/repo/branch)")
 	else
