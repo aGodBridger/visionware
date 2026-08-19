@@ -1,573 +1,380 @@
--- // VisionWare ESP
--- // Hooks into the Library (created by gui.lua) and draws player ESP for Phantom Forces.
--- // Uses the executor Drawing API when available, otherwise warns and disables rendering.
+--[[
+    Phantom Forces ESP + Aimbot
+    ============================
+    Sens              = 0.2    -- Pull strength (0.1 subtle → 1.0 strong)
+    AIMBOT_SMOOTHNESS = 0.55   -- Lerp per frame (0.1 smooth → 1.0 instant)
+    FOV_RADIUS        = 120    -- FOV circle radius in pixels
+    AIM_MODE          = "fov"  -- "fov" = closest in circle | "distance" = closest to camera
+    DRAW_FOV          = true   -- Draw the FOV circle on screen
 
-local Library = getgenv and getgenv().Library or _G.Library
-assert(Library, "[VisionWare] ESP failed: Library not found (run gui.lua first).")
+    Combined effect = Sens * Smoothness per frame
+    Current: 0.2 * 0.55 = 0.11 per frame (gentle assist)
+]]
 
--- // Services
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
-local Camera = workspace.CurrentCamera
-local RaycastParams = RaycastParams.new()
-RaycastParams.FilterType = Enum.RaycastFilterType.Blacklist
-RaycastParams.IgnoreWater = true
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Camera           = workspace.CurrentCamera
+local LocalPlayer      = Players.LocalPlayer
+local frameTick        = 0
 
--- // Drawing setup
-local HasDrawing = (Drawing and pcall(Drawing.new, "Square"))
-if not HasDrawing then
-	warn("[VisionWare] ESP: Drawing API unavailable - ESP will not render.")
+local TEAMS = {
+    ["Bright blue"]   = "Phantoms",
+    ["Bright orange"] = "Ghosts",
+}
+
+local TEAM_COLORS = {
+    ["Phantoms"] = Color3.fromRGB(0, 100, 255),
+    ["Ghosts"]   = Color3.fromRGB(255, 140, 0),
+}
+
+local Boxes        = {}
+local MAX_DISTANCE = 1000
+
+-- // Connected to the VisionWare GUI (gui.lua)
+-- // The loader runs gui.lua first, so the Library is already built here.
+-- // All settings are read from the GUI flags live, so the menu stays in sync.
+local Library = (getgenv and getgenv().Library) or _G.Library
+while not Library do
+    task.wait()
+    Library = (getgenv and getgenv().Library) or _G.Library
 end
 
-local function DrawNew(kind)
-	if HasDrawing then
-		local ok, obj = pcall(Drawing.new, kind)
-		if ok and obj then return { drawing = true, obj = obj } end
-	end
-	return nil
+local function Flag(Name, Default)
+    local f = Library and Library.Flags and Library.Flags[Name]
+    return f ~= nil and f or Default
 end
 
--- // Rainbow state
-local RainbowHue = 0
-local function NextRainbow(step)
-	step = step or 1
-	RainbowHue = (RainbowHue + step * 0.01) % 1
-	return Color3.fromHSV(RainbowHue, 1, 1)
+local function IsKeyHeld(Key)
+    if type(Key) == "EnumItem" then
+        if Key.EnumType == Enum.KeyCode then
+            return UserInputService:IsKeyDown(Key)
+        elseif Key.EnumType == Enum.UserInputType then
+            if Key == Enum.UserInputType.MouseButton1 then
+                return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+            elseif Key == Enum.UserInputType.MouseButton2 then
+                return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+            end
+        end
+    end
+    return false
 end
 
--- ===== TEAM / FRIEND HELPERS =====
--- Phantom Forces teams: Ghosts (orange) and Phantoms (blue).
-local GhostColor = BrickColor.new("Bright orange").Color
-local PhantomColor = BrickColor.new("Bright blue").Color
+_G.Sens               = 1
+_G.AIMBOT_SMOOTHNESS  = Flag("Aimbot_Smoothness", 0.2)
+_G.aimbotActive       = false -- driven by the GUI each frame (do not set manually)
+_G.FOV_RADIUS         = Flag("Aimbot_FoVSize", 120)
+_G.AIM_MODE           = "fov"   -- "fov" or "distance"
+_G.DRAW_FOV           = false  -- the GUI already draws the FoV ring
+_G.TARGET_SWITCH_DELAY = 0.15  -- seconds before locking onto a new target after one dies
 
-local function IsLocal(player)
-	return player == LocalPlayer
+local lastTarget         = nil
+local lastTargetLostTime = nil
+
+local localTeamName = TEAMS[tostring(LocalPlayer.TeamColor)] or "Unknown"
+
+-- FOV Circle drawing
+local fovCircle           = Drawing.new("Circle")
+fovCircle.Radius          = _G.FOV_RADIUS
+fovCircle.Color           = Color3.fromRGB(255, 255, 255)
+fovCircle.Thickness       = 1
+fovCircle.Filled          = false
+fovCircle.Visible         = false
+fovCircle.NumSides        = 64
+
+local function untrack(model)
+    local data = Boxes[model]
+    if not data then return end
+    pcall(function() data.sq:Remove() end)
+    pcall(function() data.label:Remove() end)
+    Boxes[model] = nil
 end
 
-local function IsFriend(player)
-	if IsLocal(player) then return true end
-	return Library.Friends and table.find(Library.Friends, player) ~= nil
+LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
+    localTeamName = TEAMS[tostring(LocalPlayer.TeamColor)] or "Unknown"
+    for _, data in pairs(Boxes) do
+        local enemyTeam = TEAMS[tostring(data.player and data.player.TeamColor)] or "Unknown"
+        data.isEnemy = enemyTeam ~= localTeamName
+        local color = TEAM_COLORS[enemyTeam] or Color3.fromRGB(255, 255, 255)
+        data.sq.Color    = color
+        data.label.Color = color
+        if not data.isEnemy then
+            data.sq.Visible    = false
+            data.label.Visible = false
+        end
+    end
+end)
+
+local function getModelBounds(model, rootPart)
+    if rootPart and (rootPart.Position - Camera.CFrame.Position).Magnitude > MAX_DISTANCE then
+        return nil
+    end
+
+    local minX, minY = math.huge,  math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local onScreen   = false
+
+    for _, part in ipairs(model:GetChildren()) do
+        if part:IsA("BasePart") then
+            local s  = part.Size * 0.5
+            local cf = part.CFrame
+            for _, offset in ipairs({
+                Vector3.new( s.X,  s.Y,  s.Z), Vector3.new(-s.X,  s.Y,  s.Z),
+                Vector3.new( s.X, -s.Y,  s.Z), Vector3.new(-s.X, -s.Y,  s.Z),
+                Vector3.new( s.X,  s.Y, -s.Z), Vector3.new(-s.X,  s.Y, -s.Z),
+                Vector3.new( s.X, -s.Y, -s.Z), Vector3.new(-s.X, -s.Y, -s.Z),
+            }) do
+                local screen, visible = Camera:WorldToViewportPoint(cf:PointToWorldSpace(offset))
+                if visible then
+                    onScreen = true
+                    minX = math.min(minX, screen.X)
+                    minY = math.min(minY, screen.Y)
+                    maxX = math.max(maxX, screen.X)
+                    maxY = math.max(maxY, screen.Y)
+                end
+            end
+        end
+    end
+
+    return onScreen and { minX, minY, maxX - minX, maxY - minY } or nil
 end
 
-local function IsTeam(player)
-	if not Library.Flags.ESP_TeamCheck then return false end
-	if IsFriend(player) then return false end
-	if not player or not LocalPlayer then return false end
-	local ours = LocalPlayer.Team
-	local theirs = player.Team
-	if ours and theirs then
-		return ours == theirs
-	end
-	-- Fallback: compare team colors when Team objects are absent
-	local oc = LocalPlayer.TeamColor
-	local tc = player.TeamColor
-	return oc and tc and oc == tc
+local function trackModel(model)
+    if not model:IsA("Model") or Boxes[model] then return end
+
+    local tag = model:FindFirstChild("PlayerTag", true)
+    if not tag or not tag:IsA("TextLabel") then return end
+
+    local name = tag.Text:match("^%s*(.-)%s*$")
+    if name == LocalPlayer.Name then return end
+
+    local player    = Players:FindFirstChild(name)
+    local enemyTeam = TEAMS[tostring(player and player.TeamColor)] or "Unknown"
+    local isEnemy   = enemyTeam ~= localTeamName
+    local color     = TEAM_COLORS[enemyTeam] or Color3.fromRGB(255, 255, 255)
+
+    local sq       = Drawing.new("Square")
+    sq.Filled      = false
+    sq.Thickness   = 2
+    sq.Color       = color
+    sq.Visible     = false
+
+    local label        = Drawing.new("Text")
+    label.Text         = name
+    label.Size         = 13
+    label.Font         = Drawing.Fonts.UI
+    label.Color        = color
+    label.Center       = true
+    label.Outline      = true
+    label.OutlineColor = Color3.fromRGB(0, 0, 0)
+    label.Visible      = false
+
+    local data = {
+        sq      = sq,
+        label   = label,
+        root    = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart"),
+        name    = name,
+        player  = player,
+        isEnemy = isEnemy,
+    }
+    Boxes[model] = data
+
+    if player then
+        player:GetPropertyChangedSignal("TeamColor"):Connect(function()
+            local newTeam  = TEAMS[tostring(player.TeamColor)] or "Unknown"
+            data.isEnemy   = newTeam ~= localTeamName
+            local newColor = TEAM_COLORS[newTeam] or Color3.fromRGB(255, 255, 255)
+            data.sq.Color    = newColor
+            data.label.Color = newColor
+            if not data.isEnemy then
+                data.sq.Visible    = false
+                data.label.Visible = false
+            end
+        end)
+    end
 end
 
-local function GetTeamColor(player)
-	-- Uses the player's own team color for accurate Ghost/Phantom colors.
-	if player.TeamColor then return player.TeamColor.Color end
-	return player.Neutral and GhostColor or PhantomColor
+-- Returns the highest BasePart position (head) in the model
+local function getModelCenter(model)
+    local highestPart = nil
+    local highestY    = -math.huge
+    for _, v in ipairs(model:GetDescendants()) do
+        if v:IsA("BasePart") and v.Position.Y > highestY then
+            highestY    = v.Position.Y
+            highestPart = v
+        end
+    end
+    return highestPart and highestPart.Position or nil
 end
 
--- ===== VISIBILITY =====
-local function IsVisible(player)
-	local char = player.Character
-	if not char then return false end
-	local root = char:FindFirstChild("HumanoidRootPart")
-	local head = char:FindFirstChild("Head")
-	if not root then return false end
+local function getClosestEnemy()
+    local closest     = nil
+    local closestDist = math.huge
+    local camPos      = Camera.CFrame.Position
+    local center      = Camera.ViewportSize / 2
 
-	local origin = Camera:GetPivot().Position
-	RaycastParams.FilterDescendantsInstances = { char, LocalPlayer.Character }
+    for model, data in pairs(Boxes) do
+        if data.isEnemy and model.Parent then
+            local pos = getModelCenter(model)
+            if pos then
+                local screenPos, visible = Camera:WorldToViewportPoint(pos)
+                if visible then
+                    if _G.AIM_MODE == "fov" then
+                        -- Distance from screen center in pixels
+                        local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+                        if screenDist < _G.FOV_RADIUS and screenDist < closestDist then
+                            closestDist = screenDist
+                            closest     = model
+                        end
+                    else
+                        -- Closest by world distance
+                        local dist = (pos - camPos).Magnitude
+                        if dist < closestDist and dist <= MAX_DISTANCE then
+                            closestDist = dist
+                            closest     = model
+                        end
+                    end
+                end
+            end
+        end
+    end
 
-	-- Check the head and the root part; visible if either line of sight hits nothing.
-	local function Check(target)
-		if not target then return false end
-		local delta = target.Position - origin
-		local ray = workspace:Raycast(origin, delta, RaycastParams)
-		return ray == nil
-	end
-
-	return Check(head) or Check(root)
+    return closest
 end
 
--- ===== RENDER DECISION =====
-local function ShouldRender(player)
-	if not Library.Flags.ESP_Enabled then return false end
-	if Library.Flags.Misc_Panic then return false end
-	if IsLocal(player) then return false end
-
-	-- Team handling
-	if IsTeam(player) then
-		if not Library.Flags.ESP_ShowTeam then return false end
-	elseif IsFriend(player) and not Library.Flags.ESP_TeamCheck then
-		-- Friend treated as friendly only when team check is meaningful; otherwise show.
-	end
-
-	local char = player.Character
-	if not char then return false end
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	if not hum or hum.Health <= 0 then return false end
-	local root = char:FindFirstChild("HumanoidRootPart")
-	if not root then return false end
-
-	-- Range
-	local Range = Library.Flags.ESP_Range or 500
-	if Range > 0 then
-		local dist = (root.Position - Camera:GetPivot().Position).Magnitude
-		if dist > Range then return false end
-	end
-
-	-- Visible only
-	if Library.Flags.ESP_VisibleOnly and not IsVisible(player) then return false end
-
-	return true
+-- Initial scan
+for _, v in ipairs(workspace.Players:GetDescendants()) do
+    trackModel(v)
 end
 
--- ===== COLOR =====
-local function GetColor(player)
-	if Library.Flags.ESP_TeamCheck and IsTeam(player) then
-		return Library.Flags.ESP_TeamColor or Color3.fromRGB(86, 227, 120)
-	end
-	if Library.Flags.ESP_TeamCheck and IsFriend(player) then
-		return Library.Flags.ESP_TeamColor or Color3.fromRGB(86, 227, 120)
-	end
-	return Library.Flags.ESP_EnemyColor or Library.Accent
-end
-
--- ===== 3D BOX =====
--- Returns 8 corner world positions of a part's bounding box.
--- Order: TBRC, TBLC, TFRC, TFLC, BBRC, BBLC, BFRC, BFLC
--- Top grows by 1.3x, bottom by 1.6x to capture head above the root part.
-local function GetBoundingVectors(part)
-	if not part then return nil end
-	local CFrame = part.CFrame
-	local Size = part.Size
-	local TopMult = 1.3
-	local BottomMult = 1.6
-
-	local Top = Size.Y * TopMult
-	local Bottom = Size.Y * BottomMult
-	local Half = 0.5
-
-	local Right = Size.X * Half
-	local Forward = Size.Z * Half
-
-	local function Point(x, y, z)
-		return CFrame:PointToWorldSpace(Vector3.new(x, y, z))
-	end
-
-	-- Top of head (use the Head part for a more accurate top edge when present)
-	local RootPos = part.Position
-	local Head = part.Parent and part.Parent:FindFirstChild("Head")
-	if Head then
-		local headTop = Head.CFrame:PointToWorldSpace(Vector3.new(0, Head.Size.Y * Half, 0))
-		Top = (RootPos - headTop).Magnitude + 0.1
-	end
-
-	return {
-		Point(Right, Top, Forward),    -- TBRC
-		Point(-Right, Top, Forward),   -- TBLC
-		Point(Right, Top, -Forward),   -- TFRC
-		Point(-Right, Top, -Forward),  -- TFLC
-		Point(Right, -Bottom, Forward),-- BBRC
-		Point(-Right, -Bottom, Forward),-- BBLC
-		Point(Right, -Bottom, -Forward),-- BFRC
-		Point(-Right, -Bottom, -Forward),-- BFLC
-	}
-end
-
--- ===== CHAMS =====
-local function ApplyChams(player)
-	pcall(function()
-		if not Library.Flags.ESP_Chams then return end
-		local char = player.Character
-		if not char then return end
-		local highlight = char:FindFirstChildOfClass("Highlight")
-			or char:FindFirstChildOfClass("HighlightInstance")
-		if not highlight then
-			highlight = Instance.new("Highlight")
-			highlight.FillTransparency = 0.5
-			highlight.OutlineTransparency = 1
-			highlight.Parent = char
-		end
-		if Library.Flags.ESP_Rainbow then
-			highlight.FillColor = NextRainbow(Library.Flags.ESP_RainbowSpeed or 1)
-		else
-			highlight.FillColor = Library.Flags.ESP_ChamsColor or Color3.fromRGB(255, 255, 255)
-		end
-	end)
-end
-
-local function RemoveChams(player)
-	pcall(function()
-		local char = player.Character
-		if not char then return end
-		local highlight = char:FindFirstChildOfClass("Highlight")
-			or char:FindFirstChildOfClass("HighlightInstance")
-		if highlight then highlight:Destroy() end
-	end)
-end
-
--- ===== PER-PLAYER STATE =====
-local PlayersList = {}
-
-local function NewLines(Count)
-	local Lines = {}
-	for _ = 1, Count do
-		table.insert(Lines, DrawNew("Line"))
-	end
-	return Lines
-end
-
-local function BuildPlayerData()
-	return {
-		BoxLines = NewLines(4),        -- 2D/3D box edge lines
-		BoxFill = DrawNew("Quad"),     -- filled box
-		CornerLines = NewLines(8),     -- corner box segments
-		Tracers = NewLines(1),
-		Skeleton = NewLines(5),
-		Head = DrawNew("Circle"),
-		Name = DrawNew("Text"),
-		Distance = DrawNew("Text"),
-		HealthText = DrawNew("Text"),
-		HealthBar = DrawNew("Square") or DrawNew("Line"),
-		HealthFill = DrawNew("Square") or DrawNew("Line"),
-	}
-end
-
-local function ClearPlayerData(data)
-	if not data then return end
-	for _, handle in pairs(data) do
-		if type(handle) == "table" then
-			if handle.obj and handle.obj.Remove then
-				pcall(handle.obj.Remove, handle.obj)
-			else
-				for _, sub in ipairs(handle) do
-					if sub.obj and sub.obj.Remove then
-						pcall(sub.obj.Remove, sub.obj)
-					end
-				end
-			end
-		end
-	end
-end
+workspace.Players.DescendantAdded:Connect(trackModel)
+workspace.Players.DescendantRemoving:Connect(untrack)
 
 Players.PlayerAdded:Connect(function(player)
-	if IsLocal(player) then return end
-	PlayersList[player] = BuildPlayerData()
+    if player.Name == LocalPlayer.Name then return end
+    player:GetPropertyChangedSignal("TeamColor"):Connect(function()
+        local newTeam  = TEAMS[tostring(player.TeamColor)] or "Unknown"
+        local newColor = TEAM_COLORS[newTeam] or Color3.fromRGB(255, 255, 255)
+        for _, data in pairs(Boxes) do
+            if data.name == player.Name then
+                data.isEnemy  = newTeam ~= localTeamName
+                data.player   = player
+                data.sq.Color    = newColor
+                data.label.Color = newColor
+                if not data.isEnemy then
+                    data.sq.Visible    = false
+                    data.label.Visible = false
+                end
+            end
+        end
+    end)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
-	local data = PlayersList[player]
-	ClearPlayerData(data)
-	PlayersList[player] = nil
-	RemoveChams(player)
+    local toRemove = {}
+    for model, data in pairs(Boxes) do
+        if data.name == player.Name then
+            toRemove[#toRemove + 1] = model
+        end
+    end
+    for _, model in ipairs(toRemove) do
+        untrack(model)
+    end
 end)
 
--- Initialize existing players
-for _, player in ipairs(Players:GetPlayers()) do
-	if not IsLocal(player) then
-		PlayersList[player] = BuildPlayerData()
-	end
-end
+RunService.Heartbeat:Connect(function()
+    frameTick += 1
 
--- ===== DRAWING HELPERS =====
-local function HideAll(data)
-	for _, handle in pairs(data) do
-		if type(handle) == "table" then
-			if handle.obj and handle.obj.Visible ~= nil then
-				handle.obj.Visible = false
+    -- Drive aimbot from the GUI (panic + enable toggle + held activation key)
+    _G.AIMBOT_SMOOTHNESS = Flag("Aimbot_Smoothness", 0.2)
+    _G.FOV_RADIUS        = Flag("Aimbot_FoVSize", 120)
+    _G.aimbotActive      = not Flag("Misc_Panic", false)
+        and Flag("Aimbot_Enabled", true)
+        and IsKeyHeld(Flag("Aimbot_Key", Enum.UserInputType.MouseButton2))
+
+    -- Update FOV circle position and visibility
+    local center = Camera.ViewportSize / 2
+    fovCircle.Position = center
+    fovCircle.Radius   = _G.FOV_RADIUS
+    fovCircle.Visible  = _G.DRAW_FOV
+
+	if _G.aimbotActive then
+		local target = getClosestEnemy()
+
+		-- Target switched or died
+		if target ~= lastTarget then
+			if lastTarget ~= nil then
+				-- Previous target was lost; start the switch timer
+				if lastTargetLostTime == nil then
+					lastTargetLostTime = tick()
+				end
+				-- Block new target until delay has passed
+				if (tick() - lastTargetLostTime) < _G.TARGET_SWITCH_DELAY then
+					target = nil
+				else
+					lastTarget         = target
+					lastTargetLostTime = nil
+				end
 			else
-				for _, sub in ipairs(handle) do
-					if sub.obj and sub.obj.Visible ~= nil then
-						sub.obj.Visible = false
-					end
+				-- No previous target, lock on immediately
+				lastTarget         = target
+				lastTargetLostTime = nil
+			end
+		else
+			-- Same target, reset timer
+			lastTargetLostTime = nil
+		end
+
+		if target then
+			local pos = getModelCenter(target)
+			if pos then
+				local screenPos, visible = Camera:WorldToViewportPoint(pos)
+				if visible then
+					local targetPos = Vector2.new(screenPos.X, screenPos.Y)
+					local delta     = (targetPos - center) * (_G.Sens * _G.AIMBOT_SMOOTHNESS)
+					mousemoverel(delta.X, delta.Y)
 				end
 			end
 		end
 	end
-end
 
-local function SetLine(h, From, To, Thickness, Color)
-	if not h then return end
-	local d = h.obj
-	d.Visible = true
-	d.From = From
-	d.To = To
-	d.Thickness = Thickness or 1
-	d.Color = Color
-end
+    if frameTick % 2 ~= 0 then return end
 
-local function SetText(h, Value, Position, Size, Color, Centre, Outline)
-	if not h then return end
-	local d = h.obj
-	d.Visible = true
-	d.Text = Value
-	d.Position = Position
-	d.Size = Size
-	d.Color = Color
-	d.Centre = Centre ~= false
-	d.Outline = Outline
-end
+    -- Hide all boxes when ESP is off or panic is active
+    if Flag("Misc_Panic", false) or not Flag("ESP_Enabled", true) then
+        for _, data in pairs(Boxes) do
+            data.sq.Visible    = false
+            data.label.Visible = false
+        end
+        return
+    end
 
--- ===== RAINBOW PART CHECK =====
-local function RainbowFor(Parts)
-	if not Library.Flags.ESP_Rainbow then return false end
-	local Target = Library.Flags.ESP_RainbowParts or "All"
-	if Target == "All" then return true end
-	for _, p in ipairs(Parts) do
-		if p == Target then return true end
-	end
-	return false
-end
+    local stale = {}
+    for model, data in pairs(Boxes) do
+        if not model.Parent then
+            stale[#stale + 1] = model
+        elseif data.isEnemy then
+            local bounds = getModelBounds(model, data.root)
+            if bounds then
+                data.sq.Position    = Vector2.new(bounds[1], bounds[2])
+                data.sq.Size        = Vector2.new(bounds[3], bounds[4])
+                data.label.Position = Vector2.new(bounds[1] + bounds[3] / 2, bounds[2] - 16)
+                data.sq.Visible     = true
+                data.label.Visible  = true
+            else
+                data.sq.Visible    = false
+                data.label.Visible = false
+            end
+        end
+    end
 
--- ===== MAIN LOOP =====
-RunService.RenderStepped:Connect(function()
-	-- Master kill switch
-	if Library.Flags.Misc_Panic then
-		for _, data in pairs(PlayersList) do
-			HideAll(data)
-			local char = data.Char
-			-- hide chams too
-		end
-		for _, player in pairs(PlayersList) do
-			RemoveChams(player)
-		end
-		return
-	end
-
-	if not Library.Flags.ESP_Enabled then
-		for _, player in pairs(PlayersList) do
-			RemoveChams(player)
-		end
-		return
-	end
-
-	for player, data in pairs(PlayersList) do
-		RemoveChams(player)
-		HideAll(data)
-
-		if not ShouldRender(player) then continue end
-
-		local char = player.Character
-		if not char then continue end
-		data.Char = char
-		local root = char:FindFirstChild("HumanoidRootPart")
-		local head = char:FindFirstChild("Head")
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		if not root or not hum then continue end
-
-		-- Chams (applied regardless of on-screen status, still range-checked)
-		if Library.Flags.ESP_Chams then ApplyChams(player) end
-
-		-- Project parts to screen
-		local HeadPos = (head or root).Position
-		local RootPos = root.Position
-		local HeadVP = Camera:WorldToViewportPoint(HeadPos)
-		local RootVP = Camera:WorldToViewportPoint(RootPos)
-		if HeadVP.Z > 1 or RootVP.Z > 1 then continue end
-
-		local Scale = math.clamp(1 / RootVP.Z, 0.1, 2)
-		local TextSize = (Library.Flags.ESP_TextSize or 13) * Scale
-		local Thick = Library.Flags.ESP_BoxThickness or 1
-		local Opacity = (Library.Flags.ESP_Opacity or 75) / 100
-
-		local Height = math.abs(HeadVP.Y - RootVP.Y)
-		local Width = math.clamp(Height * 0.6, 10, 160)
-		local Min = Vector2.new(RootVP.X - Width / 2, HeadVP.Y)
-		local Max = Vector2.new(RootVP.X + Width / 2, RootVP.Y)
-
-		local BaseColor = GetColor(player)
-
-		-- ===== BOXES =====
-		local BoxType = Library.Flags.ESP_BoxType
-		if Library.Flags.ESP_Boxes then
-			local BoxColor = BaseColor
-			if RainbowFor({"Boxes"}) then BoxColor = NextRainbow(Library.Flags.ESP_RainbowSpeed or 1) end
-
-			if BoxType == "Corner Box" then
-				local Corner = Thick
-				local Seg = 0.4
-				local corners = {
-					{ Min, Vector2.new(Min.X + Width * Seg, Min.Y) },
-					{ Min, Vector2.new(Min.X, Min.Y + Height * Seg) },
-					{ Vector2.new(Max.X, Min.Y), Vector2.new(Max.X - Width * Seg, Min.Y) },
-					{ Vector2.new(Max.X, Min.Y), Vector2.new(Max.X, Min.Y + Height * Seg) },
-					{ Vector2.new(Max.X, Max.Y), Vector2.new(Max.X - Width * Seg, Max.Y) },
-					{ Vector2.new(Max.X, Max.Y), Vector2.new(Max.X, Max.Y - Height * Seg) },
-					{ Vector2.new(Min.X, Max.Y), Vector2.new(Min.X + Width * Seg, Max.Y) },
-					{ Vector2.new(Min.X, Max.Y), Vector2.new(Min.X, Max.Y - Height * Seg) },
-				}
-				for i, pair in ipairs(corners) do
-					SetLine(data.CornerLines[i], pair[1], pair[2], Corner, BoxColor)
-				end
-			elseif BoxType == "3D Box" then
-				-- Project the 8 corners and connect the edges
-				local Corners = GetBoundingVectors(root)
-				if Corners then
-					local VPs = {}
-					for _, c in ipairs(Corners) do
-						local v = Camera:WorldToViewportPoint(c)
-						if v.Z > 1 then
-							VPs = nil
-							break
-						end
-						VPs = VPs or {}
-						table.insert(VPs, Vector2.new(v.X, v.Y))
-					end
-					if VPs then
-						-- Back face (points 4,3,7,8)
-						local edges = {
-							{1, 2}, {2, 4}, {4, 3}, {3, 1}, -- top
-							{5, 6}, {6, 8}, {8, 7}, {7, 5}, -- bottom
-							{1, 5}, {2, 6}, {3, 7}, {4, 8}, -- verticals
-						}
-						for i, e in ipairs(edges) do
-							local a = VPs[e[1]]
-							local b = VPs[e[2]]
-							if a and b then
-								SetLine(data.BoxLines[(i - 1) % 4 + 1], a, b, Thick, BoxColor)
-							end
-						end
-					end
-				end
-			elseif BoxType == "Filled Box" then
-				if data.BoxFill and data.BoxFill.obj then
-					local d = data.BoxFill.obj
-					d.Visible = true
-					d.PointA = Min
-					d.PointB = Vector2.new(Max.X, Min.Y)
-					d.PointC = Max
-					d.PointD = Vector2.new(Min.X, Max.Y)
-					d.Color = BoxColor
-					d.Transparency = 0.4 + (1 - Opacity) * 0.6
-					d.Filled = true
-				end
-			else -- "2D Box"
-				SetLine(data.BoxLines[1], Min, Vector2.new(Max.X, Min.Y), Thick, BoxColor)
-				SetLine(data.BoxLines[2], Vector2.new(Max.X, Min.Y), Max, Thick, BoxColor)
-				SetLine(data.BoxLines[3], Max, Vector2.new(Min.X, Max.Y), Thick, BoxColor)
-				SetLine(data.BoxLines[4], Vector2.new(Min.X, Max.Y), Min, Thick, BoxColor)
-			end
-		end
-
-		-- ===== HEALTH =====
-		local Health = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
-		local HealthColor = Library.Flags.ESP_HealthColor or Color3.fromRGB(0, 255, 0)
-		-- Lerp red->green when using default style
-		local HealthStyle = Library.Flags.ESP_HealthStyle or "Both"
-		local LeftSide = (Library.Flags.ESP_HealthBarSide or "Left") == "Left"
-
-		if Library.Flags.ESP_Health and (HealthStyle == "Bar" or HealthStyle == "Both") then
-			local X = LeftSide and Min.X - 5 or Max.X + 3
-			local BH = Height + 2
-			local d = data.HealthBar.obj
-			d.Visible = true
-			d.Color = Color3.fromRGB(0, 0, 0)
-			d.Position = Vector2.new(X, Min.Y - 1)
-			d.Size = Vector2.new(2, BH)
-			d.Filled = true
-			d.Transparency = 0.4
-			local f = data.HealthFill.obj
-			f.Visible = true
-			f.Color = HealthColor
-			f.Position = Vector2.new(X, Min.Y - 1 + (BH * (1 - Health)))
-			f.Size = Vector2.new(2, BH * Health)
-			f.Filled = true
-			f.Transparency = 1 - Opacity
-		end
-
-		-- ===== TEXT =====
-		local TextColor = BaseColor
-		if RainbowFor({"Text"}) then TextColor = NextRainbow(Library.Flags.ESP_RainbowSpeed or 1) end
-
-		if Library.Flags.ESP_Names then
-			local Name = Library.Flags.ESP_NameMode == "Username" and player.Name or player.DisplayName
-			SetText(data.Name, Name, Vector2.new(RootVP.X, Max.Y + 2), TextSize, TextColor, true, Library.Flags.ESP_Outline)
-		end
-
-		if Library.Flags.ESP_Distance then
-			local dist = (RootPos - Camera:GetPivot().Position).Magnitude
-			SetText(data.Distance, ("%.0f studs"):format(dist), Vector2.new(RootVP.X, Max.Y + 2 + TextSize + 1), TextSize - 2, TextColor, true, Library.Flags.ESP_Outline)
-		end
-
-		if Library.Flags.ESP_Health and (HealthStyle == "Text" or HealthStyle == "Both") then
-			SetText(data.HealthText, ("%d%%"):format(math.floor(Health * 100)), Vector2.new(RootVP.X, Min.Y - 13), TextSize - 1, HealthColor, true, Library.Flags.ESP_Outline)
-		end
-
-		-- ===== TRACERS =====
-		if Library.Flags.ESP_Tracers then
-			local TColor = Library.Flags.ESP_TracerColor or BaseColor
-			if RainbowFor({"Tracers"}) then TColor = NextRainbow(Library.Flags.ESP_RainbowSpeed or 1) end
-			local Viewport = Camera.ViewportSize
-			local origin
-			local TType = Library.Flags.ESP_TracerType or "From Bottom"
-			if TType == "From Top" then
-				origin = Vector2.new(Viewport.X / 2, 0)
-			elseif TType == "From Center" then
-				origin = Vector2.new(Viewport.X / 2, Viewport.Y / 2)
-			elseif TType == "From Mouse" then
-				local mouse = LocalPlayer:GetMouse()
-				origin = Vector2.new(mouse.X, mouse.Y)
-			else
-				origin = Vector2.new(Viewport.X / 2, Viewport.Y)
-			end
-			SetLine(data.Tracers[1], origin, RootVP, Library.Flags.ESP_TracerThickness or 1, TColor)
-		end
-
-		-- ===== SKELETON =====
-		if Library.Flags.ESP_Skeleton then
-			local SColor = Library.Flags.ESP_SkeletonColor or Color3.fromRGB(255, 255, 255)
-			if RainbowFor({"Tracers"}) then SColor = NextRainbow(Library.Flags.ESP_RainbowSpeed or 1) end
-			local Torso = char:FindFirstChild("UpperTorso") or root
-			local LH = char:FindFirstChild("LeftHand") or char:FindFirstChild("Left Arm")
-			local RH = char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm")
-			local LF = char:FindFirstChild("LeftFoot") or char:FindFirstChild("Left Leg")
-			local RF = char:FindFirstChild("RightFoot") or char:FindFirstChild("Right Leg")
-
-			local function VP(P)
-				if not P then return nil end
-				local v = Camera:WorldToViewportPoint(P.Position)
-				if v.Z > 1 then return nil end
-				return Vector2.new(v.X, v.Y)
-			end
-
-			local connections = {
-				{ head, Torso },
-				{ Torso, LH },
-				{ Torso, RH },
-				{ Torso, LF },
-				{ Torso, RF },
-			}
-			for i, pair in ipairs(connections) do
-				local A = VP(pair[1])
-				local B = VP(pair[2])
-				if A and B then
-					SetLine(data.Skeleton[i], A, B, Library.Flags.ESP_SkeletonThickness or 1, SColor)
-				end
-			end
-		end
-
-		-- ===== HEAD DOT =====
-		if Library.Flags.ESP_Head then
-			local d = data.Head.obj
-			d.Visible = true
-			local hp = Camera:WorldToViewportPoint(HeadPos)
-			d.Position = Vector2.new(hp.X, hp.Y)
-			d.Radius = 3.5
-			d.Thickness = 1
-			d.Color = BaseColor
-			d.Filled = false
-		end
-	end
+    for _, model in ipairs(stale) do
+        untrack(model)
+    end
 end)
 
--- ===== CLEANUP =====
-LocalPlayer.CharacterAdded:Connect(function()
-	RaycastParams.FilterDescendantsInstances = { LocalPlayer.Character }
-end)
+print("ESP loaded")
 
-print("[VisionWare] ESP loaded")
+
+
+      
