@@ -1,14 +1,13 @@
 --[[
-    Phantom Forces ESP + Aimbot
-    ============================
-    Sens              = 0.2    -- Pull strength (0.1 subtle → 1.0 strong)
-    AIMBOT_SMOOTHNESS = 0.55   -- Lerp per frame (0.1 smooth → 1.0 instant)
-    FOV_RADIUS        = 120    -- FOV circle radius in pixels
-    AIM_MODE          = "fov"  -- "fov" = closest in circle | "distance" = closest to camera
-    DRAW_FOV          = true   -- Draw the FOV circle on screen
+    VisionWare | ESP + Aimbot  (Phantom Forces)
+    ============================================
+    Feature set pulled from the wapus source and rebuilt as a self-contained
+    module that hooks into the VisionWare GUI (gui.lua). The loader runs
+    gui.lua first, then this file, so Library is guaranteed to exist here.
 
-    Combined effect = Sens * Smoothness per frame
-    Current: 0.2 * 0.55 = 0.11 per frame (gentle assist)
+    ESP:     2D boxes, outlines, fill, health bars, tracers, names,
+             distances, health %, chams (Highlight), team check, range.
+    Aimbot:  FOV / distance selection, smooth assist, GUI keybind + toggle.
 ]]
 
 local Players          = game:GetService("Players")
@@ -16,34 +15,379 @@ local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Camera           = workspace.CurrentCamera
 local LocalPlayer      = Players.LocalPlayer
-local frameTick        = 0
+
+-- // Wait for the GUI to finish loading, then hook into it
+local Library = (getgenv and getgenv().Library) or _G.Library
+while not Library do
+    task.wait()
+    Library = (getgenv and getgenv().Library) or _G.Library
+end
+local Flags = Library.Flags
+
+local function Flag(Name, Default)
+    local v = Flags[Name]
+    return v ~= nil and v or Default
+end
+
+local function Opacity(Percent)
+    return math.clamp((tonumber(Percent) or 100) / 100, 0, 1)
+end
 
 local TEAMS = {
     ["Bright blue"]   = "Phantoms",
     ["Bright orange"] = "Ghosts",
 }
 
-local TEAM_COLORS = {
-    ["Phantoms"] = Color3.fromRGB(0, 100, 255),
-    ["Ghosts"]   = Color3.fromRGB(255, 140, 0),
-}
+-- =====================================================================
+--  Player tracking
+-- =====================================================================
+local Tracked = {} -- [player] = data
 
-local Boxes        = {}
-local MAX_DISTANCE = 1000
-
--- // Connected to the VisionWare GUI (gui.lua)
--- // The loader runs gui.lua first, so the Library is already built here.
--- // All settings are read from the GUI flags live, so the menu stays in sync.
-local Library = (getgenv and getgenv().Library) or _G.Library
-while not Library do
-    task.wait()
-    Library = (getgenv and getgenv().Library) or _G.Library
+local function GetTeamName(player)
+    return TEAMS[tostring(player and player.TeamColor)] or "Unknown"
 end
 
-local function Flag(Name, Default)
-    local f = Library and Library.Flags and Library.Flags[Name]
-    return f ~= nil and f or Default
+local function GetCharacter(player)
+    return player and player.Character
 end
+
+local function GetRootPart(char)
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart or char:FindFirstChildWhichIsA("BasePart")
+end
+
+local function GetHead(char)
+    return char and char:FindFirstChild("Head")
+end
+
+local function CreateCharacterTracking(player)
+    local function onCharAdded(char)
+        local data = Tracked[player]
+        if data then data.char = char end
+    end
+    if player.Character then onCharAdded(player.Character) end
+    player.CharacterAdded:Connect(onCharAdded)
+end
+
+Players.PlayerAdded:Connect(CreateCharacterTracking)
+for _, p in ipairs(Players:GetPlayers()) do
+    CreateCharacterTracking(p)
+end
+
+-- =====================================================================
+--  Drawing helpers (executor Drawing API with safe guards)
+-- =====================================================================
+local function NewDrawing(kind)
+    if not (Drawing and Drawing.new) then return nil end
+    local ok, d = pcall(Drawing.new, kind)
+    return ok and d or nil
+end
+
+-- Helper: create a vector from a world point to screen
+local function WorldToScreen(pos)
+    local s, onScreen = Camera:WorldToViewportPoint(pos)
+    return Vector2.new(s.X, s.Y), onScreen, s.Z
+end
+
+-- =====================================================================
+--  ESP state per player
+-- =====================================================================
+local function NewEsp(player)
+    local esp = {
+        player = player,
+        char   = player.Character,
+        sqOutline = NewDrawing("Square"), -- box outline (black, behind)
+        sq       = NewDrawing("Square"),  -- box
+        sqFill   = NewDrawing("Square"),  -- fill
+        health   = NewDrawing("Square"),  -- health bar
+        tracer   = NewDrawing("Line"),    -- tracer
+        nameLbl  = NewDrawing("Text"),    -- name
+        distLbl  = NewDrawing("Text"),    -- distance
+        hpLbl    = NewDrawing("Text"),    -- health %
+        highlight = nil,
+    }
+
+    local function StyleText(t, size)
+        if not t then return end
+        t.Size = size or 13
+        t.Font = Drawing.Fonts.UI
+        t.Center = true
+        t.Outline = true
+        t.OutlineColor = Color3.fromRGB(0, 0, 0)
+        t.Visible = false
+    end
+    StyleText(esp.nameLbl)
+    StyleText(esp.distLbl)
+    StyleText(esp.hpLbl)
+
+    if esp.sq then esp.sq.Filled = false; esp.sq.Visible = false end
+    if esp.sqFill then esp.sqFill.Filled = true; esp.sqFill.Visible = false end
+    if esp.sqOutline then esp.sqOutline.Filled = false; esp.sqOutline.Visible = false end
+    if esp.health then esp.health.Filled = true; esp.health.Visible = false end
+    if esp.tracer then esp.tracer.Visible = false end
+
+    -- Chams via Roblox Highlight (no Drawing required)
+    if Flag("ESP_Chams", true) then
+        esp.highlight = Instance.new("Highlight")
+        esp.highlight.Name = "VisionWareCham"
+        esp.highlight.FillColor = Flag("ESP_ChamsColor", Color3.fromRGB(255, 255, 255))
+        esp.highlight.OutlineColor = Color3.fromRGB(0, 0, 0)
+        esp.highlight.FillTransparency = 0.7
+        esp.highlight.OutlineTransparency = 0
+        esp.highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        esp.highlight.Adornee = player.Character
+        esp.highlight.Parent = game:GetService("CoreGui")
+        -- Highlight has no ChildAdded/adornee-change visibility; refresh each frame instead
+    end
+
+    player.CharacterAdded:Connect(function(char)
+        esp.char = char
+        if esp.highlight then esp.highlight.Adornee = char end
+    end)
+
+    return esp
+end
+
+Players.PlayerAdded:Connect(function(player)
+    Tracked[player] = NewEsp(player)
+end)
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then Tracked[p] = NewEsp(p) end
+end
+Players.PlayerRemoving:Connect(function(player)
+    local esp = Tracked[player]
+    if not esp then return end
+    pcall(function()
+        for _, obj in ipairs({ esp.sq, esp.sqFill, esp.sqOutline, esp.health, esp.tracer, esp.nameLbl, esp.distLbl, esp.hpLbl }) do
+            if obj then obj:Remove() end
+        end
+    end)
+    pcall(function() if esp.highlight then esp.highlight:Destroy() end end)
+    Tracked[player] = nil
+end)
+
+-- =====================================================================
+--  Render loop
+-- =====================================================================
+RunService.RenderStepped:Connect(function()
+    local panic = Flag("Misc_Panic", false)
+    local espOn = not panic and Flag("ESP_Enabled", true)
+    local range = Flag("ESP_Range", 1000) or 1000
+    local camPos = Camera.CFrame.Position
+    local showTeam = Flag("ESP_ShowTeam", false)
+    local thickness = Flag("ESP_BoxThickness", 1) or 1
+    local textSize = Flag("ESP_TextSize", 13) or 13
+    local drawBoxes = espOn and Flag("ESP_Boxes", true)
+    local drawHealth = espOn and Flag("ESP_Health", true)
+    local drawTracers = espOn and Flag("ESP_Tracers", true)
+    local drawNames = espOn and Flag("ESP_Names", true)
+    local drawDist = espOn and Flag("ESP_Distance", false)
+    local drawChams = espOn and Flag("ESP_Chams", true)
+    local drawHP = espOn and (Flag("ESP_HealthStyle", "Both") == "Text" or Flag("ESP_HealthStyle", "Both") == "Both")
+    local useOutline = espOn and Flag("ESP_Outline", true)
+    local fillEnabled = espOn and Flag("ESP_BoxType", "2D Box") == "Filled Box"
+    local enemyCol = Flag("ESP_EnemyColor", Color3.fromRGB(0, 255, 255))
+    local teamCol = Flag("ESP_TeamColor", Color3.fromRGB(86, 227, 120))
+    local opacity = Flag("ESP_Opacity", 75)
+
+    for _, esp in pairs(Tracked) do
+        local player = esp.player
+        local char = GetCharacter(player)
+        local root = GetRootPart(char)
+        local head = GetHead(char)
+        local show = espOn and char and root and char:FindFirstChild("Humanoid")
+
+        local teamCheck = Flag("ESP_TeamCheck", true)
+        local enemy = GetTeamName(player) ~= GetTeamName(LocalPlayer)
+        local isTeam = not enemy
+        local showThis = show and (enemy or (isTeam and showTeam and not teamCheck))
+
+        if not showThis then
+            pcall(function()
+                for _, obj in ipairs({ esp.sq, esp.sqFill, esp.sqOutline, esp.health, esp.tracer, esp.nameLbl, esp.distLbl, esp.hpLbl }) do
+                    if obj then obj.Visible = false end
+                end
+            end)
+            if esp.highlight then esp.highlight.Enabled = false end
+            continue
+        end
+
+        local color = enemy and enemyCol or teamCol
+
+        -- Distance check
+        local dist = (root.Position - camPos).Magnitude
+        if dist > range then
+            pcall(function()
+                for _, obj in ipairs({ esp.sq, esp.sqFill, esp.sqOutline, esp.health, esp.tracer, esp.nameLbl, esp.distLbl, esp.hpLbl }) do
+                    if obj then obj.Visible = false end
+                end
+            end)
+            if esp.highlight then esp.highlight.Enabled = false end
+            continue
+        end
+
+        -- Screen projection of head / feet
+        local headPos = (head and head.Position or root.Position) + (head and Vector3.new(0, 0.5, 0) or Vector3.zero)
+        local feetPos = root.Position - Vector3.new(0, root.Size.Y * 0.5, 0)
+
+        local top, topOn = WorldToScreen(headPos)
+        local bot, botOn = WorldToScreen(feetPos)
+        if not topOn and not botOn then
+            pcall(function()
+                for _, obj in ipairs({ esp.sq, esp.sqFill, esp.sqOutline, esp.health, esp.tracer, esp.nameLbl, esp.distLbl, esp.hpLbl }) do
+                    if obj then obj.Visible = false end
+                end
+            end)
+            continue
+        end
+
+        local height = math.abs(top.Y - bot.Y)
+        local width = height * 0.6
+        if height < 5 then
+            pcall(function()
+                for _, obj in ipairs({ esp.sq, esp.sqFill, esp.sqOutline, esp.health, esp.tracer, esp.nameLbl, esp.distLbl, esp.hpLbl }) do
+                    if obj then obj.Visible = false end
+                end
+            end)
+            continue
+        end
+
+        local left = top.X - width / 2
+        local bboxTop = top.Y
+        local bboxBot = bot.Y
+        local cy = (bboxTop + bboxBot) / 2
+
+        -- Chams
+        if esp.highlight then
+            if drawChams and not panic then
+                esp.highlight.Enabled = true
+                if Flag("ESP_Rainbow", false) then
+                    esp.highlight.FillColor = Color3.fromHSV((tick() % 1), 1, 1)
+                else
+                    esp.highlight.FillColor = Flag("ESP_ChamsColor", Color3.fromRGB(255, 255, 255))
+                end
+            else
+                esp.highlight.Enabled = false
+            end
+        end
+
+        -- Box
+        if drawBoxes and esp.sq then
+            local o = Opacity(opacity)
+            local inset = 1
+
+            if useOutline and esp.sqOutline then
+                esp.sqOutline.Color = Color3.fromRGB(0, 0, 0)
+                esp.sqOutline.Thickness = thickness + 2
+                esp.sqOutline.Transparency = o
+                esp.sqOutline.Position = Vector2.new(left, bboxTop)
+                esp.sqOutline.Size = Vector2.new(width, height)
+                esp.sqOutline.Visible = true
+            elseif esp.sqOutline then
+                esp.sqOutline.Visible = false
+            end
+
+            esp.sq.Color = color
+            esp.sq.Thickness = thickness
+            esp.sq.Transparency = o
+            esp.sq.Position = Vector2.new(left + inset, bboxTop + inset)
+            esp.sq.Size = Vector2.new(width - inset * 2, height - inset * 2)
+            esp.sq.Visible = true
+
+            if fillEnabled and esp.sqFill then
+                esp.sqFill.Color = color
+                esp.sqFill.Transparency = o * 0.3
+                esp.sqFill.Position = esp.sq.Position
+                esp.sqFill.Size = esp.sq.Size
+                esp.sqFill.Visible = true
+            elseif esp.sqFill then
+                esp.sqFill.Visible = false
+            end
+        else
+            if esp.sq then esp.sq.Visible = false end
+            if esp.sqFill then esp.sqFill.Visible = false end
+            if esp.sqOutline then esp.sqOutline.Visible = false end
+        end
+
+        -- Health bar (left side)
+        if drawHealth and esp.health then
+            local humanoid = char:FindFirstChild("Humanoid")
+            local hp = humanoid and humanoid.Health or 100
+            local maxHp = humanoid and humanoid.MaxHealth or 100
+            local frac = math.clamp(hp / maxHp, 0, 1)
+            local barW = 3
+            local barX = left - barW - 3
+            local o = Opacity(opacity)
+            esp.health.Color = Color3.fromRGB(255, math.floor(255 * frac), math.floor(255 * (1 - frac)))
+            esp.health.Transparency = o
+            esp.health.Position = Vector2.new(barX, bboxTop + (height * (1 - frac)))
+            esp.health.Size = Vector2.new(barW, height * frac)
+            esp.health.Visible = true
+
+            if drawHP and esp.hpLbl then
+                esp.hpLbl.Text = tostring(math.floor(frac * 100)) .. "%"
+                esp.hpLbl.Color = color
+                esp.hpLbl.Size = textSize - 3
+                esp.hpLbl.Position = Vector2.new(left + width + 4, cy - (textSize / 2))
+                esp.hpLbl.Visible = true
+            elseif esp.hpLbl then
+                esp.hpLbl.Visible = false
+            end
+        elseif esp.health then
+            esp.health.Visible = false
+            if esp.hpLbl then esp.hpLbl.Visible = false end
+        end
+
+        -- Tracer from bottom center of screen
+        if drawTracers and esp.tracer then
+            local camSize = Camera.ViewportSize
+            local from = Vector2.new(camSize.X / 2, camSize.Y)
+            local origin = Flag("ESP_TracerType", "From Bottom")
+            if origin == "From Top" then from = Vector2.new(camSize.X / 2, 0)
+            elseif origin == "From Center" then from = Vector2.new(camSize.X / 2, camSize.Y / 2)
+            elseif origin == "From Mouse" then from = Vector2.new(camSize.X / 2, camSize.Y) end
+
+            esp.tracer.From = from
+            esp.tracer.To = Vector2.new(left + width / 2, bboxBot)
+            esp.tracer.Color = color
+            esp.tracer.Thickness = Flag("ESP_TracerThickness", 1) or 1
+            esp.tracer.Transparency = Opacity(opacity)
+            esp.tracer.Visible = true
+        elseif esp.tracer then
+            esp.tracer.Visible = false
+        end
+
+        -- Name label
+        if drawNames and esp.nameLbl then
+            local nameMode = Flag("ESP_NameMode", "DisplayName")
+            local label = nameMode == "Username" and player.Name or player.DisplayName
+            esp.nameLbl.Text = label
+            esp.nameLbl.Color = color
+            esp.nameLbl.Size = textSize
+            esp.nameLbl.Position = Vector2.new(left + width / 2, bboxTop - textSize - 2)
+            esp.nameLbl.Visible = true
+
+            if drawDist and esp.distLbl then
+                esp.distLbl.Text = string.format("%.0fm", dist)
+                esp.distLbl.Color = color
+                esp.distLbl.Size = textSize - 4
+                esp.distLbl.Position = Vector2.new(left + width / 2, bboxBot + 4)
+                esp.distLbl.Visible = true
+            elseif esp.distLbl then
+                esp.distLbl.Visible = false
+            end
+        elseif esp.nameLbl then
+            esp.nameLbl.Visible = false
+            if esp.distLbl then esp.distLbl.Visible = false end
+        end
+    end
+end)
+
+-- =====================================================================
+--  Aimbot
+-- =====================================================================
+local lastTarget = nil
+local lastTargetLostTime = nil
 
 local function IsKeyHeld(Key)
     if type(Key) == "EnumItem" then
@@ -60,321 +404,109 @@ local function IsKeyHeld(Key)
     return false
 end
 
-_G.Sens               = 1
-_G.AIMBOT_SMOOTHNESS  = Flag("Aimbot_Smoothness", 0.2)
-_G.aimbotActive       = false -- driven by the GUI each frame (do not set manually)
-_G.FOV_RADIUS         = Flag("Aimbot_FoVSize", 120)
-_G.AIM_MODE           = "fov"   -- "fov" or "distance"
-_G.DRAW_FOV           = false  -- the GUI already draws the FoV ring
-_G.TARGET_SWITCH_DELAY = 0.15  -- seconds before locking onto a new target after one dies
-
-local lastTarget         = nil
-local lastTargetLostTime = nil
-
-local localTeamName = TEAMS[tostring(LocalPlayer.TeamColor)] or "Unknown"
-
--- FOV Circle drawing
-local fovCircle           = Drawing.new("Circle")
-fovCircle.Radius          = _G.FOV_RADIUS
-fovCircle.Color           = Color3.fromRGB(255, 255, 255)
-fovCircle.Thickness       = 1
-fovCircle.Filled          = false
-fovCircle.Visible         = false
-fovCircle.NumSides        = 64
-
-local function untrack(model)
-    local data = Boxes[model]
-    if not data then return end
-    pcall(function() data.sq:Remove() end)
-    pcall(function() data.label:Remove() end)
-    Boxes[model] = nil
-end
-
-LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
-    localTeamName = TEAMS[tostring(LocalPlayer.TeamColor)] or "Unknown"
-    for _, data in pairs(Boxes) do
-        local enemyTeam = TEAMS[tostring(data.player and data.player.TeamColor)] or "Unknown"
-        data.isEnemy = enemyTeam ~= localTeamName
-        local color = TEAM_COLORS[enemyTeam] or Color3.fromRGB(255, 255, 255)
-        data.sq.Color    = color
-        data.label.Color = color
-        if not data.isEnemy then
-            data.sq.Visible    = false
-            data.label.Visible = false
-        end
-    end
-end)
-
-local function getModelBounds(model, rootPart)
-    if rootPart and (rootPart.Position - Camera.CFrame.Position).Magnitude > MAX_DISTANCE then
-        return nil
-    end
-
-    local minX, minY = math.huge,  math.huge
-    local maxX, maxY = -math.huge, -math.huge
-    local onScreen   = false
-
-    for _, part in ipairs(model:GetChildren()) do
-        if part:IsA("BasePart") then
-            local s  = part.Size * 0.5
-            local cf = part.CFrame
-            for _, offset in ipairs({
-                Vector3.new( s.X,  s.Y,  s.Z), Vector3.new(-s.X,  s.Y,  s.Z),
-                Vector3.new( s.X, -s.Y,  s.Z), Vector3.new(-s.X, -s.Y,  s.Z),
-                Vector3.new( s.X,  s.Y, -s.Z), Vector3.new(-s.X,  s.Y, -s.Z),
-                Vector3.new( s.X, -s.Y, -s.Z), Vector3.new(-s.X, -s.Y, -s.Z),
-            }) do
-                local screen, visible = Camera:WorldToViewportPoint(cf:PointToWorldSpace(offset))
-                if visible then
-                    onScreen = true
-                    minX = math.min(minX, screen.X)
-                    minY = math.min(minY, screen.Y)
-                    maxX = math.max(maxX, screen.X)
-                    maxY = math.max(maxY, screen.Y)
-                end
-            end
-        end
-    end
-
-    return onScreen and { minX, minY, maxX - minX, maxY - minY } or nil
-end
-
-local function trackModel(model)
-    if not model:IsA("Model") or Boxes[model] then return end
-
-    local tag = model:FindFirstChild("PlayerTag", true)
-    if not tag or not tag:IsA("TextLabel") then return end
-
-    local name = tag.Text:match("^%s*(.-)%s*$")
-    if name == LocalPlayer.Name then return end
-
-    local player    = Players:FindFirstChild(name)
-    local enemyTeam = TEAMS[tostring(player and player.TeamColor)] or "Unknown"
-    local isEnemy   = enemyTeam ~= localTeamName
-    local color     = TEAM_COLORS[enemyTeam] or Color3.fromRGB(255, 255, 255)
-
-    local sq       = Drawing.new("Square")
-    sq.Filled      = false
-    sq.Thickness   = 2
-    sq.Color       = color
-    sq.Visible     = false
-
-    local label        = Drawing.new("Text")
-    label.Text         = name
-    label.Size         = 13
-    label.Font         = Drawing.Fonts.UI
-    label.Color        = color
-    label.Center       = true
-    label.Outline      = true
-    label.OutlineColor = Color3.fromRGB(0, 0, 0)
-    label.Visible      = false
-
-    local data = {
-        sq      = sq,
-        label   = label,
-        root    = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart"),
-        name    = name,
-        player  = player,
-        isEnemy = isEnemy,
-    }
-    Boxes[model] = data
-
-    if player then
-        player:GetPropertyChangedSignal("TeamColor"):Connect(function()
-            local newTeam  = TEAMS[tostring(player.TeamColor)] or "Unknown"
-            data.isEnemy   = newTeam ~= localTeamName
-            local newColor = TEAM_COLORS[newTeam] or Color3.fromRGB(255, 255, 255)
-            data.sq.Color    = newColor
-            data.label.Color = newColor
-            if not data.isEnemy then
-                data.sq.Visible    = false
-                data.label.Visible = false
-            end
-        end)
-    end
-end
-
--- Returns the highest BasePart position (head) in the model
-local function getModelCenter(model)
-    local highestPart = nil
-    local highestY    = -math.huge
-    for _, v in ipairs(model:GetDescendants()) do
-        if v:IsA("BasePart") and v.Position.Y > highestY then
-            highestY    = v.Position.Y
-            highestPart = v
-        end
-    end
-    return highestPart and highestPart.Position or nil
-end
-
-local function getClosestEnemy()
-    local closest     = nil
-    local closestDist = math.huge
-    local camPos      = Camera.CFrame.Position
-    local center      = Camera.ViewportSize / 2
-
-    for model, data in pairs(Boxes) do
-        if data.isEnemy and model.Parent then
-            local pos = getModelCenter(model)
-            if pos then
-                local screenPos, visible = Camera:WorldToViewportPoint(pos)
-                if visible then
-                    if _G.AIM_MODE == "fov" then
-                        -- Distance from screen center in pixels
-                        local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
-                        if screenDist < _G.FOV_RADIUS and screenDist < closestDist then
-                            closestDist = screenDist
-                            closest     = model
-                        end
-                    else
-                        -- Closest by world distance
-                        local dist = (pos - camPos).Magnitude
-                        if dist < closestDist and dist <= MAX_DISTANCE then
-                            closestDist = dist
-                            closest     = model
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    return closest
-end
-
--- Initial scan
-for _, v in ipairs(workspace.Players:GetDescendants()) do
-    trackModel(v)
-end
-
-workspace.Players.DescendantAdded:Connect(trackModel)
-workspace.Players.DescendantRemoving:Connect(untrack)
-
-Players.PlayerAdded:Connect(function(player)
-    if player.Name == LocalPlayer.Name then return end
-    player:GetPropertyChangedSignal("TeamColor"):Connect(function()
-        local newTeam  = TEAMS[tostring(player.TeamColor)] or "Unknown"
-        local newColor = TEAM_COLORS[newTeam] or Color3.fromRGB(255, 255, 255)
-        for _, data in pairs(Boxes) do
-            if data.name == player.Name then
-                data.isEnemy  = newTeam ~= localTeamName
-                data.player   = player
-                data.sq.Color    = newColor
-                data.label.Color = newColor
-                if not data.isEnemy then
-                    data.sq.Visible    = false
-                    data.label.Visible = false
-                end
-            end
-        end
+local function MoveMouse(dx, dy)
+    pcall(function()
+        if mousemoverel then mousemoverel(dx, dy)
+        elseif syn and syn.input and syn.input.mousemoverel then syn.input.mousemoverel(dx, dy) end
     end)
-end)
+end
 
-Players.PlayerRemoving:Connect(function(player)
-    local toRemove = {}
-    for model, data in pairs(Boxes) do
-        if data.name == player.Name then
-            toRemove[#toRemove + 1] = model
+local function GetAimTarget()
+    local mode = Flag("Aimbot_Target", "Closest to Crosshair")
+    local hitpart = Flag("Aimbot_Hitpart", "Head")
+    local camPos = Camera.CFrame.Position
+    local center = Camera.ViewportSize / 2
+    local best, bestScore = nil, math.huge
+
+    for _, esp in pairs(Tracked) do
+        local player = esp.player
+        if player == LocalPlayer then continue end
+        if Flag("Aimbot_TeamCheck", true) and GetTeamName(player) == GetTeamName(LocalPlayer) then continue end
+
+        local char = GetCharacter(player)
+        local root = GetRootPart(char)
+        if not char or not root or not char:FindFirstChild("Humanoid") then continue end
+
+        local part = char:FindFirstChild(hitpart) or root
+        local pos = part.Position
+        if (pos - camPos).Magnitude > (Flag("ESP_Range", 1000) or 1000) then continue end
+
+        local screen, onScreen = WorldToScreen(pos)
+        if not onScreen then continue end
+
+        local score
+        if mode == "Closest to Player" then
+            score = (pos - camPos).Magnitude
+        else -- Closest to Crosshair / Lowest Health
+            local h = char:FindFirstChild("Humanoid")
+            score = (screen - center).Magnitude
+            if mode == "Lowest Health" then
+                score = score + (h and (h.MaxHealth - h.Health) * 100 or 0)
+            end
+        end
+
+        if score < bestScore then
+            bestScore = score
+            best = esp
         end
     end
-    for _, model in ipairs(toRemove) do
-        untrack(model)
-    end
-end)
+    return best
+end
 
 RunService.Heartbeat:Connect(function()
-    frameTick += 1
+    local panic = Flag("Misc_Panic", false)
+    local enabled = not panic and Flag("Aimbot_Enabled", true)
+    local key = Flag("Aimbot_Key", Enum.UserInputType.MouseButton2)
+    _G.aimbotActive = enabled and IsKeyHeld(key)
 
-    -- Drive aimbot from the GUI (panic + enable toggle + held activation key)
-    _G.AIMBOT_SMOOTHNESS = Flag("Aimbot_Smoothness", 0.2)
-    _G.FOV_RADIUS        = Flag("Aimbot_FoVSize", 120)
-    _G.aimbotActive      = not Flag("Misc_Panic", false)
-        and Flag("Aimbot_Enabled", true)
-        and IsKeyHeld(Flag("Aimbot_Key", Enum.UserInputType.MouseButton2))
-
-    -- Update FOV circle position and visibility
-    local center = Camera.ViewportSize / 2
-    fovCircle.Position = center
-    fovCircle.Radius   = _G.FOV_RADIUS
-    fovCircle.Visible  = _G.DRAW_FOV
-
-	if _G.aimbotActive then
-		local target = getClosestEnemy()
-
-		-- Target switched or died
-		if target ~= lastTarget then
-			if lastTarget ~= nil then
-				-- Previous target was lost; start the switch timer
-				if lastTargetLostTime == nil then
-					lastTargetLostTime = tick()
-				end
-				-- Block new target until delay has passed
-				if (tick() - lastTargetLostTime) < _G.TARGET_SWITCH_DELAY then
-					target = nil
-				else
-					lastTarget         = target
-					lastTargetLostTime = nil
-				end
-			else
-				-- No previous target, lock on immediately
-				lastTarget         = target
-				lastTargetLostTime = nil
-			end
-		else
-			-- Same target, reset timer
-			lastTargetLostTime = nil
-		end
-
-		if target then
-			local pos = getModelCenter(target)
-			if pos then
-				local screenPos, visible = Camera:WorldToViewportPoint(pos)
-				if visible then
-					local targetPos = Vector2.new(screenPos.X, screenPos.Y)
-					local delta     = (targetPos - center) * (_G.Sens * _G.AIMBOT_SMOOTHNESS)
-					mousemoverel(delta.X, delta.Y)
-				end
-			end
-		end
-	end
-
-    if frameTick % 2 ~= 0 then return end
-
-    -- Hide all boxes when ESP is off or panic is active
-    if Flag("Misc_Panic", false) or not Flag("ESP_Enabled", true) then
-        for _, data in pairs(Boxes) do
-            data.sq.Visible    = false
-            data.label.Visible = false
-        end
+    if not _G.aimbotActive then
+        lastTarget = nil
         return
     end
 
-    local stale = {}
-    for model, data in pairs(Boxes) do
-        if not model.Parent then
-            stale[#stale + 1] = model
-        elseif data.isEnemy then
-            local bounds = getModelBounds(model, data.root)
-            if bounds then
-                data.sq.Position    = Vector2.new(bounds[1], bounds[2])
-                data.sq.Size        = Vector2.new(bounds[3], bounds[4])
-                data.label.Position = Vector2.new(bounds[1] + bounds[3] / 2, bounds[2] - 16)
-                data.sq.Visible     = true
-                data.label.Visible  = true
-            else
-                data.sq.Visible    = false
-                data.label.Visible = false
-            end
+    local useFov = Flag("Aimbot_FoV", true)
+    local fovRadius = Flag("Aimbot_FoVSize", 50) or 50
+    local smooth = Flag("Aimbot_Smoothness", 0.2) or 0.2
+    local center = Camera.ViewportSize / 2
+    local hitpart = Flag("Aimbot_Hitpart", "Head")
+
+    local target = GetAimTarget()
+
+    -- Enforce FOV for "Closest to Crosshair" style
+    if target and useFov and Flag("Aimbot_Target", "Closest to Crosshair") == "Closest to Crosshair" then
+        local char = GetCharacter(target.player)
+        local part = char:FindFirstChild(hitpart) or GetRootPart(char)
+        local screen, onScreen = WorldToScreen(part and part.Position or Vector3.zero)
+        if onScreen and (screen - center).Magnitude > fovRadius then
+            target = nil
         end
     end
 
-    for _, model in ipairs(stale) do
-        untrack(model)
+    -- Target switch delay
+    if target and target ~= lastTarget then
+        if lastTarget and lastTargetLostTime and (tick() - lastTargetLostTime) < 0.15 then
+            target = nil
+        else
+            lastTarget = target
+            lastTargetLostTime = nil
+        end
     end
+    if not target and lastTarget then
+        if not lastTargetLostTime then lastTargetLostTime = tick() end
+        lastTarget = nil
+    end
+
+    if not target then return end
+
+    local char = GetCharacter(target.player)
+    local part = char and (char:FindFirstChild(hitpart) or GetRootPart(char))
+    if not part then return end
+
+    local screen, onScreen = WorldToScreen(part.Position)
+    if not onScreen then return end
+
+    local delta = (screen - center) * smooth
+    MoveMouse(delta.X, delta.Y)
 end)
 
-print("ESP loaded")
-
-
-
-      
+print("VisionWare ESP + Aimbot loaded")
