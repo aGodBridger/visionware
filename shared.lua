@@ -221,6 +221,18 @@ function Vision.IsKeyHeld(Key)
     return false
 end
 
+-- Returns true while a GUI keybind is active.
+-- GUI keybinds (Mode "Hold") store a LIVE BOOLEAN in the flag while the key
+-- is held (true on press / false on release), with the bound key enum in
+-- flagName .. "_KEY". If the flag still holds an EnumItem (default or a saved
+-- config), fall back to IsKeyHeld. Returns false when the flag is nil.
+function Vision.KeyActive(flagName, defaultKey)
+    local v = Vision.Flag(flagName, defaultKey)
+    if type(v) == "boolean" then return v end
+    if type(v) == "EnumItem" then return Vision.IsKeyHeld(v) end
+    return false
+end
+
 function Vision.MoveMouse(dx, dy)
     pcall(function()
         if mousemoverel then

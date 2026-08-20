@@ -59,8 +59,7 @@ RunService.Heartbeat:Connect(function()
 
     local panic = Vision.IsPanic()
     local enabled = not panic and Flag("Aimbot_Enabled", true)
-    local key = Flag("Aimbot_Key", Enum.UserInputType.MouseButton2)
-    local active = enabled and Vision.IsKeyHeld(key)
+    local active = enabled and Vision.KeyActive("Aimbot_Key", Enum.UserInputType.MouseButton2)
 
     if not active then
         lastTarget = nil

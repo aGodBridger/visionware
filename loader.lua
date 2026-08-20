@@ -4,6 +4,16 @@ local Repo = "https://raw.githubusercontent.com/aGodBridger/visionware/refs/head
 local RootName = (identifyexecutor and identifyexecutor()) or "Executor"
 print("[VisionWare] loader running on " .. RootName)
 
+-- Guard: never run twice in the same session. Re-running duplicates the GUI
+-- and double-connects every feature (that looks like broken / always-on cheats).
+local Already = (getgenv and getgenv().VisionWareLoaded) or _G.VisionWareLoaded
+if Already then
+    print("[VisionWare] already loaded this session - rejoin the game before running again")
+    return
+end
+_G.VisionWareLoaded = true
+if getgenv then getgenv().VisionWareLoaded = true end
+
 local function Get(url)
     local ok, res = pcall(function() return game:HttpGet(url) end)
     if not ok or type(res) ~= "string" then

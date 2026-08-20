@@ -35,13 +35,17 @@ local function MyRoot()
 end
 
 -- =====================================================================
---  Infinite jump
+--  Infinite jump (throttled so holding Space doesn't spam-jump nonstop)
 -- =====================================================================
+local lastJump = 0
 UserInputService.InputBegan:Connect(function(inp, gameProcessed)
     if gameProcessed then return end
     if inp.KeyCode == Enum.KeyCode.Space and Flag("Misc_JumpInfinite", false) then
+        local now = tick()
+        if now - lastJump < 0.12 then return end
         local h = MyHumanoid()
         if h and h.Health > 0 then
+            lastJump = now
             h:ChangeState(Enum.HumanoidStateType.None)
             task.wait(0.01)
             h:ChangeState(Enum.HumanoidStateType.Jumping)
@@ -88,12 +92,11 @@ RunService.Heartbeat:Connect(function(dt)
         end)
     end
 
-    -- Fly
+    -- Fly (unbound key = fly whenever the toggle is on)
     if Flag("Misc_Fly", false) then
         local speed = Flag("Misc_FlySpeed", 50) or 50
-        local flyKey = Flag("Misc_FlyKey")
-        local activeFly = true
-        if flyKey then activeFly = Vision.IsKeyHeld(flyKey) end
+        local flyKeySet = Flag("Misc_FlyKey") ~= nil
+        local activeFly = (not flyKeySet) or Vision.KeyActive("Misc_FlyKey")
         if activeFly then
             local camera = Vision.GetCamera()
             local move = hum.MoveDirection

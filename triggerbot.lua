@@ -24,8 +24,7 @@ local lastShot = 0
 
 RunService.Heartbeat:Connect(function(t)
     if Vision.IsPanic() or not Flag("Triggerbot_Enabled", false) then return end
-    local key = Flag("Triggerbot_Key")
-    if key and not Vision.IsKeyHeld(key) then return end
+    if not Vision.KeyActive("Triggerbot_Key") then return end
 
     local camera = Vision.GetCamera()
     if not camera then return end

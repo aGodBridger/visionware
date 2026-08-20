@@ -39,8 +39,7 @@ local SilentState = { hitPos = nil, target = nil, screen = nil }
 local function Active()
     if Vision.IsPanic() then return false end
     if not Flag("SilentAim_Enabled", true) then return false end
-    local key = Flag("SilentAim_Key", Enum.UserInputType.MouseButton1)
-    return Vision.IsKeyHeld(key)
+    return Vision.KeyActive("SilentAim_Key", Enum.UserInputType.MouseButton1)
 end
 
 -- =====================================================================
