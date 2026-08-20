@@ -1,116 +1,31 @@
 --[[
-    VisionWare | ESP + Aimbot  (full feature set)
-    =============================================
-    Comprehensive ESP + Aimbot wired into every VisionWare flag.
-    Designed to LOAD reliably on any executor:
-      - Bounded waits (never infinite-loops waiting for modules).
-      - The camera is resolved fresh every frame (never captured at load).
-      - Every game access is nil/pcall-safe -> degrades gracefully until
-        the round starts, instead of erroring or hanging.
-
-    ESP features:  boxes (2D / 3D / Corner / Filled), outline, thickness,
-        names, distances, health bar + style + side, tracers (4 origins),
-        skeleton, head dot, chams, colors, opacity, range, team check,
-        visible-only, rainbow (parts Selectable).
-    Aimbot:       toggle, target mode, hitpart, keybind, smoothness, FoV,
-        team check, panic master, target switch delay.
-
-    Fixes one-at-a-time as requested.
+    VisionWare | esp.lua
+    ====================
+    ESP as its own module. Uses the shared `Vision` API (shared.lua).
+    Features: 2D / 3D / Corner / Filled boxes, outline, names, distance,
+    health bar, tracers, skeleton, head dot, chams, rainbow, team colors,
+    range, visible-only.
 ]]
 
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local LocalPlayer      = Players.LocalPlayer
-
--- =====================================================================
---  Wait for the VisionWare GUI (bounded ~10s so we never HANG).
--- =====================================================================
-local Library, Flags
+local Vision
 for _ = 1, 100 do
-    Library = (getgenv and getgenv().Library) or _G.Library
-    if Library and Library.Flags then break end
+    Vision = (getgenv and getgenv().Vision) or _G.Vision
+    if Vision and Vision.Flag then break end
     task.wait(0.1)
 end
-Flags = (Library and Library.Flags) or {}
-
-local function Flag(Name, Default)
-    local v = Flags[Name]
-    return v ~= nil and v or Default
+if not Vision then
+    warn("[VisionWare] esp.lua could not find shared API")
+    return
 end
 
-local function Opacity(Percent)
-    return math.clamp((tonumber(Percent) or 100) / 100, 0, 1)
-end
-
-local function GetCamera()
-    return workspace.CurrentCamera
-end
-
-local function IsPanic()
-    return Flag("Misc_Panic", false)
-end
-
-local function GetChar(player)
-    return player and player.Character
-end
-
-local function GetRoot(char)
-    if not char then return nil end
-    return char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart or char:FindFirstChildWhichIsA("BasePart")
-end
-
--- Generic team detection for any Roblox game.
--- A teammate is someone whose HumanoidRootPart carries a "TeammateLabel" child
--- (the common pattern across many games), or who shares the same Team and is
--- not Neutral. Everyone else (and Neutral/no-team players) is treated as an enemy.
-local function IsEnemy(player)
-    if player == LocalPlayer then return false end
-    local root = GetRoot(GetChar(player))
-    if root and root:FindFirstChild("TeammateLabel") then return false end
-    if player.Neutral then return true end
-    local myTeam = LocalPlayer.Team
-    local theirTeam = player.Team
-    if myTeam and theirTeam and myTeam == theirTeam then return false end
-    return true
-end
-
-local function GetHead(char)
-    return char and char:FindFirstChild("Head")
-end
+local Players = Vision.Players
+local RunService = Vision.RunService
+local LocalPlayer = Vision.LocalPlayer
+local Flag = Vision.Flag
 
 -- =====================================================================
---  Drawing helpers
+--  Per-player ESP objects (drawings created once)
 -- =====================================================================
-local function NewDrawing(kind)
-    if not (Drawing and Drawing.new) then return nil end
-    local ok, d = pcall(Drawing.new, kind)
-    return ok and d or nil
-end
-
-local function WorldToScreen(pos)
-    local camera = GetCamera()
-    if not camera then return nil, false end
-    local s, ok = camera:WorldToViewportPoint(pos)
-    return Vector2.new(s.X, s.Y), ok
-end
-
-local function IsVisibleFromCamera(pos, targetChar)
-    local camera = GetCamera()
-    if not camera then return true end
-    local origin = camera.CFrame.Position
-    local ray = workspace:Raycast(origin, pos - origin)
-    if not ray then return true end
-    local inst = ray.Instance
-    if not inst then return true end
-    return inst:IsDescendantOf(targetChar) or inst == targetChar
-end
-
--- =====================================================================
---  Per-player ESP object (Drawings created ONCE)
--- =====================================================================
-local Tracked = {}
-
 local SKELETON_LINKS = {
     {"HumanoidRootPart", "LowerTorso"},
     {"LowerTorso", "UpperTorso"},
@@ -123,17 +38,16 @@ local SKELETON_LINKS = {
 
 local function NewEsp(player)
     local esp = {
-        player = player,
-        sq        = NewDrawing("Square"),  -- 2D / filled box
-        sqOutline = NewDrawing("Square"),  -- box black outline
-        health    = NewDrawing("Square"),  -- health bar
-        tracer    = NewDrawing("Line"),    -- tracer
-        nameLbl   = NewDrawing("Text"),    -- name
-        distLbl   = NewDrawing("Text"),    -- distance
-        hpLbl     = NewDrawing("Text"),    -- health %
-        headDot   = NewDrawing("Square"),  -- head dot
-        skeleton  = {},                    -- 3D box edges + skeleton lines (lazy)
-        highlight = nil,                   -- chams
+        sq        = Vision.NewDrawing("Square"),
+        sqOutline = Vision.NewDrawing("Square"),
+        health    = Vision.NewDrawing("Square"),
+        tracer    = Vision.NewDrawing("Line"),
+        nameLbl   = Vision.NewDrawing("Text"),
+        distLbl   = Vision.NewDrawing("Text"),
+        hpLbl     = Vision.NewDrawing("Text"),
+        headDot   = Vision.NewDrawing("Square"),
+        skeleton  = {},
+        highlight = nil,
     }
 
     local function StyleText(t)
@@ -163,21 +77,22 @@ end
 
 local function GetSkeletonLine(esp, i)
     if not esp.skeleton[i] then
-        local l = NewDrawing("Line")
+        local l = Vision.NewDrawing("Line")
         if l then l.Visible = false end
         esp.skeleton[i] = l
     end
     return esp.skeleton[i]
 end
 
-Players.PlayerAdded:Connect(function(p)
-    if p ~= LocalPlayer then Tracked[p] = NewEsp(p) end
-end)
-for _, p in ipairs(Players:GetPlayers()) do
-    if p ~= LocalPlayer then Tracked[p] = NewEsp(p) end
+-- Attach esp objects to the shared tracked entries
+for player, entry in pairs(Vision.Tracked) do
+    if player ~= LocalPlayer and not entry.esp then
+        entry.esp = NewEsp(player)
+    end
 end
-Players.PlayerRemoving:Connect(function(player)
-    local esp = Tracked[player]
+
+local function CleanupEsp(player, entry)
+    local esp = entry and entry.esp
     if not esp then return end
     pcall(function()
         for _, k in ipairs({ "sq", "sqOutline", "health", "tracer", "nameLbl", "distLbl", "hpLbl", "headDot" }) do
@@ -186,11 +101,12 @@ Players.PlayerRemoving:Connect(function(player)
         for _, l in ipairs(esp.skeleton) do if l then l:Remove() end end
     end)
     pcall(function() if esp.highlight then esp.highlight:Destroy() end end)
-    Tracked[player] = nil
-end)
+    entry.esp = nil
+end
+Vision.OnPlayerRemoving = Vision.OnPlayerRemoving or CleanupEsp
 
 -- =====================================================================
---  ESP RENDER
+--  ESP render
 -- =====================================================================
 local lastRender = 0
 if Drawing and Drawing.new then
@@ -198,10 +114,10 @@ RunService.RenderStepped:Connect(function()
     if tick() - lastRender < 1 / 30 then return end
     lastRender = tick()
 
-    local panic = IsPanic()
+    local panic = Vision.IsPanic()
     local espOn = not panic and Flag("ESP_Enabled", true)
     local range = Flag("ESP_Range", 1000) or 1000
-    local camera = GetCamera()
+    local camera = Vision.GetCamera()
     if not camera then return end
     local camPos = camera.CFrame.Position
     local camSize = camera.ViewportSize
@@ -233,16 +149,17 @@ RunService.RenderStepped:Connect(function()
     local rainbowParts = Flag("ESP_RainbowParts", "All")
     local enemyCol = Flag("ESP_EnemyColor", Color3.fromRGB(0, 255, 255)) or Color3.fromRGB(0, 255, 255)
     local teamCol  = Flag("ESP_TeamColor", Color3.fromRGB(86, 227, 120)) or Color3.fromRGB(86, 227, 120)
-    local opacity = Opacity(Flag("ESP_Opacity", 75))
+    local opacity = Vision.Opacity(Flag("ESP_Opacity", 75))
     local chamCol = Flag("ESP_ChamsColor", Color3.fromRGB(255, 255, 255)) or Color3.fromRGB(255, 255, 255)
 
-    for _, esp in pairs(Tracked) do
-        local player = esp.player
-        local char = GetChar(player)
-        local root = GetRoot(char)
-        local head = GetHead(char)
+    for player, entry in pairs(Vision.Tracked) do
+        local esp = entry.esp
+        if not esp then continue end
+        local char = Vision.GetChar(player)
+        local root = Vision.GetRoot(char)
+        local head = Vision.GetHead(char)
 
-        local enemy = IsEnemy(player)
+        local enemy = Vision.IsEnemy(player)
         local isTeam = not enemy
         local showThis = espOn and char and root and char:FindFirstChild("Humanoid") and (enemy or (isTeam and showTeam and not teamCheck))
 
@@ -274,7 +191,7 @@ RunService.RenderStepped:Connect(function()
         end
 
         if visibleOnly then
-            local visible = IsVisibleFromCamera(head and head.Position or root.Position, char)
+            local visible = Vision.IsVisibleFromCamera(head and head.Position or root.Position, char)
             if not visible then
                 HideAll()
                 if esp.highlight then esp.highlight.Enabled = false end
@@ -285,8 +202,8 @@ RunService.RenderStepped:Connect(function()
         local headPos = (head and head.Position or root.Position) + (head and Vector3.new(0, 0.5, 0) or Vector3.zero)
         local feetPos = root.Position - Vector3.new(0, root.Size.Y * 0.5, 0)
 
-        local top, topOn = WorldToScreen(headPos)
-        local bot, botOn = WorldToScreen(feetPos)
+        local top, topOn = Vision.WorldToScreen(headPos)
+        local bot, botOn = Vision.WorldToScreen(feetPos)
         if not top or not bot or (not topOn and not botOn) then
             HideAll()
             continue
@@ -332,7 +249,7 @@ RunService.RenderStepped:Connect(function()
 
         -- Box (per type)
         if boxOn and esp.sq then
-            local o = Opacity(opacity)
+            local o = Vision.Opacity(opacity)
             local inset = 1
 
             if boxType == "2D Box" or boxType == "Filled Box" or boxType == "Corner Box" then
@@ -348,7 +265,6 @@ RunService.RenderStepped:Connect(function()
                 end
 
                 if boxType == "Corner Box" then
-                    -- corner brackets drawn as 8 short lines (an L per corner)
                     esp.sq.Visible = false
                     local cLen = math.clamp(width * 0.25, 8, width)
                     local tl, tr, bl, br = Vector2.new(left, bboxTop), Vector2.new(left + width, bboxTop), Vector2.new(left, bboxBot), Vector2.new(left + width, bboxBot)
@@ -378,15 +294,10 @@ RunService.RenderStepped:Connect(function()
                     esp.sq.Transparency = o
                     esp.sq.Position = Vector2.new(left + inset, bboxTop + inset)
                     esp.sq.Size = Vector2.new(width - inset * 2, height - inset * 2)
-                    if boxType == "Filled Box" then
-                        esp.sq.Filled = true
-                    else
-                        esp.sq.Filled = false
-                    end
+                    esp.sq.Filled = boxType == "Filled Box"
                     esp.sq.Visible = true
                 end
             elseif boxType == "3D Box" then
-                -- project the character's 8 world corners and draw edges
                 esp.sq.Visible = false
                 if esp.sqOutline then esp.sqOutline.Visible = false end
                 local hrp = root
@@ -403,7 +314,7 @@ RunService.RenderStepped:Connect(function()
                     Vector3.new(hx / 4, hy / 2, hz), Vector3.new(-hx / 4, hy / 2, hz),
                 }
                 for _, o in ipairs(offsets) do
-                    local p, ok = WorldToScreen(cf:PointToWorldSpace(o))
+                    local p, ok = Vision.WorldToScreen(cf:PointToWorldSpace(o))
                     corners[#corners + 1] = ok and p or nil
                 end
                 local edges = {
@@ -420,7 +331,7 @@ RunService.RenderStepped:Connect(function()
                             l.To = b
                             l.Color = color
                             l.Thickness = thickness + 1
-                            l.Transparency = Opacity(opacity)
+                            l.Transparency = Vision.Opacity(opacity)
                             l.Visible = true
                         end
                     end
@@ -439,8 +350,8 @@ RunService.RenderStepped:Connect(function()
                 local a = char:FindFirstChild(pair[1])
                 local b = char:FindFirstChild(pair[2])
                 if a and b then
-                    local pa, onA = WorldToScreen(a.Position)
-                    local pb, onB = WorldToScreen(b.Position)
+                    local pa, onA = Vision.WorldToScreen(a.Position)
+                    local pb, onB = Vision.WorldToScreen(b.Position)
                     if pa and pb and (onA or onB) then
                         local l = GetSkeletonLine(esp, i)
                         if l then
@@ -459,8 +370,8 @@ RunService.RenderStepped:Connect(function()
 
         -- Head dot
         if headOn and esp.headDot then
-            local hp, on = WorldToScreen(head and head.Position or root.Position)
-            if hp and (on or true) then
+            local hp, _ = Vision.WorldToScreen(head and head.Position or root.Position)
+            if hp then
                 esp.headDot.Color = color
                 esp.headDot.Position = hp - Vector2.new(thickness, thickness) * 2
                 esp.headDot.Size = Vector2.new(thickness * 4, thickness * 4)
@@ -479,7 +390,7 @@ RunService.RenderStepped:Connect(function()
             local barW = 3
             local sideSign = hbSide == "Left" and -1 or 1
             local barX = sideSign == -1 and (left - barW - 3) or (left + width + 3)
-            local o = Opacity(opacity)
+            local o = Vision.Opacity(opacity)
             esp.health.Color = Color3.fromRGB(255, math.floor(255 * frac), math.floor(255 * (1 - frac)))
             esp.health.Transparency = o
             esp.health.Position = Vector2.new(barX, bboxTop + (height * (1 - frac)))
@@ -506,7 +417,7 @@ RunService.RenderStepped:Connect(function()
             if tracerOrigin == "From Top" then from = Vector2.new(camSize.X / 2, 0)
             elseif tracerOrigin == "From Center" then from = Vector2.new(camSize.X / 2, camSize.Y / 2)
             elseif tracerOrigin == "From Mouse" then
-                local m = Players.LocalPlayer:GetMouse()
+                local m = LocalPlayer:GetMouse()
                 from = Vector2.new(m.X, m.Y)
             end
 
@@ -546,136 +457,4 @@ RunService.RenderStepped:Connect(function()
 end)
 end
 
--- =====================================================================
---  AIMBOT  (mousemoverel, universal)
--- =====================================================================
-local function IsKeyHeld(Key)
-    if type(Key) == "EnumItem" then
-        if Key.EnumType == Enum.KeyCode then
-            return UserInputService:IsKeyDown(Key)
-        elseif Key.EnumType == Enum.UserInputType then
-            if Key == Enum.UserInputType.MouseButton1 then
-                return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
-            elseif Key == Enum.UserInputType.MouseButton2 then
-                return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
-            end
-        end
-    end
-    return false
-end
-
-local function MoveMouse(dx, dy)
-    pcall(function()
-        if mousemoverel then mousemoverel(dx, dy)
-        elseif syn and syn.input and syn.input.mousemoverel then syn.input.mousemoverel(dx, dy) end
-    end)
-end
-
-local lastTarget, lastTargetLostTime
-local velCache = {} -- [player] = { pos, time }
-
-local function GetAimTarget()
-    local mode = Flag("Aimbot_Target", "Closest to Crosshair")
-    local hitpart = Flag("Aimbot_Hitpart", "Head")
-    local camera = GetCamera()
-    if not camera then return nil end
-    local camPos = camera.CFrame.Position
-    local center = camera.ViewportSize / 2
-    local best, bestScore = nil, math.huge
-
-    for _, esp in pairs(Tracked) do
-        local player = esp.player
-        if player == LocalPlayer then continue end
-        if Flag("Aimbot_TeamCheck", true) and not IsEnemy(player) then continue end
-
-        local char = GetChar(player)
-        local root = GetRoot(char)
-        if not char or not root or not char:FindFirstChild("Humanoid") then continue end
-
-        local part = char:FindFirstChild(hitpart) or root
-        if not part then continue end
-        local pos = part.Position
-        if (pos - camPos).Magnitude > (Flag("ESP_Range", 1000) or 1000) then continue end
-
-        local screen, onScreen = WorldToScreen(pos)
-        if not screen or not onScreen then continue end
-
-        local score
-        if mode == "Closest to Player" then
-            score = (pos - camPos).Magnitude
-        else
-            local h = char:FindFirstChild("Humanoid")
-            score = (screen - center).Magnitude
-            if mode == "Lowest Health" then
-                score = score + (h and (h.MaxHealth - h.Health) * 100 or 0)
-            end
-        end
-
-        if score < bestScore then
-            bestScore = score
-            best = esp
-        end
-    end
-    return best
-end
-
-RunService.Heartbeat:Connect(function()
-    local panic = IsPanic()
-    local enabled = not panic and Flag("Aimbot_Enabled", true)
-    local key = Flag("Aimbot_Key", Enum.UserInputType.MouseButton2)
-    local active = enabled and IsKeyHeld(key)
-    _G.aimbotActive = active
-
-    if not active then
-        lastTarget = nil
-        return
-    end
-
-    local camera = GetCamera()
-    if not camera then return end
-
-    local useFov = Flag("Aimbot_FoV", true)
-    local fovRadius = Flag("Aimbot_FoVSize", 50) or 50
-    local smooth = Flag("Aimbot_Smoothness", 0.2) or 0.2
-    local hitpart = Flag("Aimbot_Hitpart", "Head")
-    local center = camera.ViewportSize / 2
-
-    local target = GetAimTarget()
-
-    if target and useFov and Flag("Aimbot_Target", "Closest to Crosshair") == "Closest to Crosshair" then
-        local char = GetChar(target.player)
-        local part = char and (char:FindFirstChild(hitpart) or GetRoot(char))
-        local screen, onScreen = WorldToScreen(part and part.Position or Vector3.zero)
-        if screen and onScreen and (screen - center).Magnitude > fovRadius then
-            target = nil
-        end
-    end
-
-    -- Target switch delay
-    if target and target ~= lastTarget then
-        if lastTarget and lastTargetLostTime and (tick() - lastTargetLostTime) < 0.15 then
-            target = nil
-        else
-            lastTarget = target
-            lastTargetLostTime = nil
-        end
-    end
-    if not target and lastTarget then
-        if not lastTargetLostTime then lastTargetLostTime = tick() end
-        lastTarget = nil
-    end
-
-    if not target then return end
-
-    local char = GetChar(target.player)
-    local part = char and (char:FindFirstChild(hitpart) or GetRoot(char))
-    if not part then return end
-
-    local screen, onScreen = WorldToScreen(part.Position)
-    if not screen or not onScreen then return end
-
-    local delta = (screen - center) * smooth
-    MoveMouse(delta.X, delta.Y)
-end)
-
-print("[VisionWare] ESP + Aimbot loaded (full feature set)")
+print("[VisionWare] esp.lua loaded")
