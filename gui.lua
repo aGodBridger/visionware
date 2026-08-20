@@ -897,6 +897,89 @@ do
 
 			AccentOutline.Parent = UI
 
+			-- =====================================================================
+			--  MODERN STYLING: dim layer, window glow, rounded corners, falling snow
+			-- =====================================================================
+			do
+				-- Full-screen ~10% black dim so the menu pops over the game
+				local Dim = Instance.new("Frame")
+				Dim.Name = "VisionDim"
+				Dim.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+				Dim.BackgroundTransparency = 0.9
+				Dim.BorderSizePixel = 0
+				Dim.Size = UDim2.new(1, 0, 1, 0)
+				Dim.ZIndex = 1
+				Dim.Active = false
+				Dim.Parent = UI
+
+				-- Window glow + rounded corners
+				local WindowCorner = Instance.new("UICorner")
+				WindowCorner.CornerRadius = UDim.new(0, 12)
+				WindowCorner.Parent = AccentOutline
+
+				local Glow = Instance.new("UIStroke")
+				Glow.Name = "VisionGlow"
+				Glow.Thickness = 14
+				Glow.Color = Library.Accent
+				Glow.Transparency = 0.45
+				Glow.Parent = AccentOutline
+
+				-- Round the inner frame to match the window outline
+				local InlineCorner = Instance.new("UICorner")
+				InlineCorner.CornerRadius = UDim.new(0, 12)
+				InlineCorner.Parent = Inline
+
+				AccentOutline.ZIndex = 2
+
+				-- Falling snow overlay
+				local Flakes = {}
+				local function SpawnSnow()
+					local RS = game:GetService("RunService")
+					local random = Random.new()
+					for _ = 1, 40 do
+						local f = Instance.new("Frame")
+						f.Name = "SnowFlake"
+						f.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+						f.BackgroundTransparency = random:NextNumber(0.0, 0.35)
+						f.BorderSizePixel = 0
+						f.Active = false
+						f.ZIndex = 99999999
+						local c = Instance.new("UICorner")
+						c.CornerRadius = UDim.new(1, 0)
+						c.Parent = f
+						f.Parent = UI
+
+						table.insert(Flakes, {
+							frame = f,
+							x = random:NextNumber(0, 1),
+							y = random:NextNumber(0, 1),
+							speed = random:NextNumber(0.03, 0.09),
+							sway = random:NextNumber(0.4, 1.4),
+							phase = random:NextNumber(0, math.pi * 2),
+							size = random:NextNumber(1, 4),
+						})
+					end
+					task.spawn(function()
+						local start = tick()
+						while true do
+							local dt = RS.Heartbeat:Wait()
+							local t = tick() - start
+							for _, fl in ipairs(Flakes) do
+								fl.y = fl.y + fl.speed * dt
+								if fl.y > 1.05 then
+									fl.y = -0.05
+									fl.x = random:NextNumber(0, 1)
+								end
+								local x = fl.x + math.sin(t * fl.sway + fl.phase) * 0.015
+								fl.frame.Position = UDim2.new(math.clamp(x, 0, 1), 0, fl.y, 0)
+								fl.frame.Size = UDim2.new(0, fl.size, 0, fl.size)
+							end
+						end
+					end)
+				end
+				SpawnSnow()
+			end
+
 			-- // Elements
 			Window.Elements = {
 				TabHolder = Tabs,
@@ -4458,7 +4541,7 @@ end
 
 -- ===== COMBAT =====
 local Aimbot = MainPage:Section({Name = "Aimbot"})
-local Trigger = MainPage:Section({Name = "Triggerbot / Weapon", Side = "Right"})
+local Trigger = MainPage:Section({Name = "Triggerbot", Side = "Right"})
 
 Aimbot:Toggle({Name = "Enable Aimbot", Flag = "Aimbot_Enabled", Default = true})
 Aimbot:List({Name = "Target Selection", Flag = "Aimbot_Target", Options = {"Closest to Crosshair", "Closest to Player", "Lowest Health"}, Default = "Closest to Crosshair"})
@@ -4489,9 +4572,6 @@ Trigger:Toggle({Name = "Enable Triggerbot", Flag = "Triggerbot_Enabled"})
 Trigger:Keybind({Name = "Trigger Key", Flag = "Triggerbot_Key", Mode = "Hold"})
 Trigger:Toggle({Name = "Team Check", Flag = "Triggerbot_TeamCheck"})
 Trigger:Slider({Name = "Fire Rate", Flag = "Triggerbot_FireRate", Min = 1, Max = 20, Default = 10, Decimals = 1})
-Trigger:Divider({Name = "Weapon"})
-Trigger:Toggle({Name = "No Recoil", Flag = "Weapons_NoRecoil"})
-Trigger:Toggle({Name = "No Spread", Flag = "Weapons_NoSpread"})
 
 -- ===== ESP =====
 local ESP = ESPPage:Section({Name = "Players"})
