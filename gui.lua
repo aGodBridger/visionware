@@ -919,9 +919,9 @@ do
 
 				local Glow = Instance.new("UIStroke")
 				Glow.Name = "VisionGlow"
-				Glow.Thickness = 14
+				Glow.Thickness = 3
 				Glow.Color = Library.Accent
-				Glow.Transparency = 0.45
+				Glow.Transparency = 0.5
 				Glow.Parent = AccentOutline
 
 				-- Round the inner frame to match the window outline
@@ -931,12 +931,12 @@ do
 
 				AccentOutline.ZIndex = 2
 
-				-- Falling snow overlay
+				-- Falling snow overlay (lightweight: few flakes, size set once)
 				local Flakes = {}
 				local function SpawnSnow()
 					local RS = game:GetService("RunService")
 					local random = Random.new()
-					for _ = 1, 40 do
+					for _ = 1, 22 do
 						local f = Instance.new("Frame")
 						f.Name = "SnowFlake"
 						f.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
@@ -944,6 +944,8 @@ do
 						f.BorderSizePixel = 0
 						f.Active = false
 						f.ZIndex = 99999999
+						local sz = random:NextNumber(1, 3)
+						f.Size = UDim2.fromOffset(sz, sz)
 						local c = Instance.new("UICorner")
 						c.CornerRadius = UDim.new(1, 0)
 						c.Parent = f
@@ -956,7 +958,6 @@ do
 							speed = random:NextNumber(0.03, 0.09),
 							sway = random:NextNumber(0.4, 1.4),
 							phase = random:NextNumber(0, math.pi * 2),
-							size = random:NextNumber(1, 4),
 						})
 					end
 					task.spawn(function()
@@ -971,8 +972,7 @@ do
 									fl.x = random:NextNumber(0, 1)
 								end
 								local x = fl.x + math.sin(t * fl.sway + fl.phase) * 0.015
-								fl.frame.Position = UDim2.new(math.clamp(x, 0, 1), 0, fl.y, 0)
-								fl.frame.Size = UDim2.new(0, fl.size, 0, fl.size)
+								fl.frame.Position = UDim2.fromScale(math.clamp(x, 0, 1), fl.y)
 							end
 						end
 					end)
